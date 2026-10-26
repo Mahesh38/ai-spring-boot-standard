@@ -13,7 +13,7 @@ Agents follow this order:
 
 1. Section 2, then the Boot 4 trap table in section 3.
 2. Section 5, and place every new file before writing it. Name it with section 7, and keep the member order from section 5. Section 20 is the only layout.
-3. Section 8 before introducing a class. Copy an accepted snippet. For any HTTP endpoint, read section 11 before choosing the path, method, status, or headers. Then read the layer section for the code you are about to write (sections 10–15).
+3. Section 8 before introducing a class. Copy an accepted snippet. For any HTTP endpoint, read section 11 before choosing the path, method, status, or headers. Read section 17 before authentication, authorization, secrets, or a deploy file, and section 18 before adding a log line. Then read the layer section for the code you are about to write (sections 10–15).
 4. Section 19, and write the tests with the production code.
 5. Section 23 before you finish.
 
@@ -41,8 +41,9 @@ Examples use `com.company.orderservice`. Replace `company` with the organization
 - Mapping between layers is MapStruct. Injected JSON mapping uses the Boot auto-configured Jackson 3 `JsonMapper`.
 - A behavior change ships with the test type in section 19. The ArchUnit test stays green.
 - Outbound HTTP has a connect timeout and a read timeout.
-- The service is a stateless OAuth2 resource server. Authenticate every route except the health and info probes.
-- Logs are structured. They contain the aggregate id and the trace id. They never contain secrets, tokens, or raw credentials.
+- The service is a stateless OAuth2 resource server. It validates the bearer JWT itself. The gateway and the mesh are not a substitute. Authenticate every route except the health and info probes.
+- Logs are ECS JSON on stdout. They contain the aggregate id and the Micrometer `traceId`. They never contain secrets, tokens, cards, national identifiers, or emails.
+- The image runs as a non-root user. A new service ships `catalog-info.yaml` and a default-deny `NetworkPolicy`. CI publishes a CycloneDX SBOM and fails a HIGH or CRITICAL vulnerability that has a fix.
 - Design choices match the accepted snippets in section 8. A principle is not a reason to add a service interface, a `Utils` class, a setter-only model, or a base class.
 - Names use the four shapes in section 7. Layout is Palantir Java Format: four-space indent, 120-character lines, explicit imports. Google's two-space style and Oracle's 80-column style are not used.
 - A new library must be on the approved list in section 21, or the change must say why and a human must accept it.
@@ -59,7 +60,7 @@ Examples use `com.company.orderservice`. Replace `company` with the organization
 | Persistence | Spring Data JPA, Hibernate, PostgreSQL, Flyway |
 | Mapping | MapStruct |
 | Security | `spring-boot-starter-security` and `spring-boot-starter-security-oauth2-resource-server` |
-| Operations | Actuator, Micrometer, structured JSON logs, OpenTelemetry when the platform traces |
+| Operations | Actuator, Micrometer, ECS JSON logs on stdout, OpenTelemetry traces over OTLP |
 | Tests | JUnit Jupiter (the Boot 4.1 BOM manages Jupiter 6), AssertJ, Mockito, Testcontainers, ArchUnit |
 | Build | Maven. A service that already uses Gradle keeps Gradle and the same package layout. A new service uses Maven. Do not convert a build tool inside a feature change. |
 
@@ -112,7 +113,11 @@ order-service/
 ├── pom.xml
 ├── CODING_STANDARD.md
 ├── README.md
+├── catalog-info.yaml
+├── Dockerfile
 ├── .editorconfig
+├── deploy/
+│   └── network-policy.yaml
 ├── src/main/java/com/company/orderservice/
 │   ├── OrderServiceApplication.java
 │   ├── config/
@@ -272,6 +277,9 @@ class OrderConstants {
 | A technical type already needed by a second feature | `shared/error` or `shared/web` |
 | A scheduled job | `{feature}/infrastructure/{Job}Job.java` calling an application service |
 | A cross-cutting servlet filter | `shared/web` |
+| The service catalog entry | `catalog-info.yaml` at the repository root |
+| Who may open a connection to this process | `deploy/network-policy.yaml` |
+| The image user and the jar entrypoint | `Dockerfile` at the repository root |
 
 ### Starter types that exist in every service
 
@@ -1395,6 +1403,8 @@ One `@RestControllerAdvice` exists: `ApiExceptionHandler`. A feature adds an exc
 - Base URL and both timeouts come from `@ConfigurationProperties`. No URL is hard-coded.
 - The adapter maps the remote payload into our types (anti-corruption). A remote DTO does not leak into `application` or `domain`.
 - Timeouts fail the call. Retries are allowed for idempotent calls only, with a small fixed number and a bounded delay. A create is not retried unless the idempotency contract is in place.
+- Build the client from the injected `RestClient.Builder`. That builder sends the current W3C `traceparent`. `RestClient.builder()` and `RestClient.create()` drop it.
+- The remote URL is `https`. TLS certificate checks stay on. An all-trusting client is a defect.
 - Map a remote 404 to our `NotFoundException` only when absence is part of our use case. Map a timeout or a 5xx to a dedicated exception that the handler turns into `502` or `504`. Do not wrap it as a 500 with the remote body attached.
 - WebClient and declarative HTTP interfaces are for a WebFlux service. An MVC service does not add them.
 
@@ -1403,6 +1413,7 @@ Messaging, when the feature publishes:
 - Write an outbox row in the same transaction as the aggregate.
 - A relay in `infrastructure/messaging` publishes after commit and marks the row sent.
 - Delivery is at least once. Consumers are idempotent.
+- The relay copies the current Micrometer trace onto the published message. The consumer continues that trace. A hand-rolled `X-Correlation-ID` is not a second trace.
 - Do not publish to a broker and then commit the database, and do not commit and then publish in the request thread with no outbox.
 - Until a feature publishes, do not add an outbox "for later".
 
@@ -1536,6 +1547,9 @@ management:
       probes:
         enabled: true
       show-details: never
+  tracing:
+    sampling:
+      probability: 0.1
 
 logging:
   structured:
@@ -1553,26 +1567,241 @@ Virtual threads handle request work. Do not create a platform-thread pool for or
 
 `build-info` is produced by the Spring Boot Maven plugin so `/actuator/info` shows the version.
 
-## 17. Security
+## 17. Security and compliance
 
-- Every service ships `SecurityFilterChain`. Sessions are stateless. CSRF is disabled because the API is a token API with no cookie session.
-- The resource server validates JWTs. Authorization rules that are per use case use `@PreAuthorize` on the application service, with method security enabled.
-- `permitAll` is limited to `/actuator/health/**` and `/actuator/info`.
-- Actuator's business port is `8081`. `env`, `beans`, `heapdump`, and `mappings` are not exposed.
-- CORS, when a browser calls the service directly, lists explicit origins. It is not `*`.
-- Passwords, tokens, card numbers, national identifiers, and connection strings are not logged, not put in exceptions, and not put in Problem Details.
-- SQL goes through JPA or Spring's parameter binding. Do not concatenate a request value into SQL, JPQL, or a native query.
-- Dependencies are reviewed when added. Do not add a parser for XML from external users without saying so in the change.
+Zero trust applies to this service. The gateway, the mesh, and the vault are platform controls. This repository still validates the caller, omits secrets from source, and ships the evidence an audit can read. A blog list of products does not add a second gateway, a second mesh, or a second policy engine.
+
+### Edge and the caller
+
+The API gateway terminates external TLS, rate-limits, and routes. It is not a module of this service. Do not add Spring Cloud Gateway or Kong configuration here.
+
+The gateway forwards the caller's bearer JWT. This service validates that JWT on every business request: signature, issuer, audience, and expiry. A request that reached the pod without a gateway hop is still unauthenticated.
+
+Accepted. Stateless token API, method security on, probes open, everything else authenticated.
+
+```java
+@Configuration(proxyBeanMethods = false)
+@EnableMethodSecurity
+class SecurityConfig {
+
+    @Bean
+    SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        return http
+                .csrf(csrf -> csrf.disable())
+                .sessionManagement(sessions -> sessions.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                .authorizeHttpRequests(auth -> auth
+                        .requestMatchers("/actuator/health/**", "/actuator/info").permitAll()
+                        .anyRequest().authenticated())
+                .oauth2ResourceServer(oauth -> oauth.jwt(Customizer.withDefaults()))
+                .build();
+    }
+}
+```
+
+`permitAll` stops at those two matchers. The `local` profile may also permit the springdoc paths from section 16. Actuator listens on `8081`. `env`, `beans`, `heapdump`, and `mappings` stay unexposed. `server.forward-headers-strategy` stays `framework`, and the network policy below is what keeps that port reachable only from the gateway.
+
+Rejected. The service trusts the gateway and stops checking tokens.
+
+```java
+.authorizeHttpRequests(auth -> auth.anyRequest().permitAll())
+```
+
+### East-west traffic
+
+The cluster mesh encrypts service-to-service traffic with mutual TLS and gives the workload an identity. The service does not embed Istio or Linkerd, and it does not load mesh certificates in Java.
+
+The caller's authority is still the JWT. A mesh identity is not a substitute for it. Outbound URLs use `https`, and certificate checks stay on (section 15).
+
+### Authorization
+
+Two different questions stay in two places.
+
+| Question | Where it is answered |
+| --- | --- |
+| May this caller invoke the use case? | `@PreAuthorize` on the public application-service method, checking one authority from the JWT (`SCOPE_orders.write`) |
+| Is this state change legal for the aggregate? | The aggregate method (section 8 and section 10) |
+
+`@PreAuthorize` runs because the controller calls the Spring bean. A self-call on the same instance skips it, the same way it skips `@Transactional`.
+
+Accepted. This is the section 10 method plus the authority check.
+
+```java
+@PreAuthorize("hasAuthority('SCOPE_orders.write')")
+@Transactional
+public Order cancel(CancelOrderCommand command) {
+    Order order = orders.findById(command.orderId())
+            .orElseThrow(() -> new OrderNotFoundException(command.orderId()));
+    order.cancel(command.reason());
+    return orders.save(order);
+}
+```
+
+A policy engine is not part of a feature change. Open Policy Agent is the only engine, and only after the same authorization decision is already required by a third service. It is then one port in `application` and one adapter in `infrastructure`. Oso is not added. The aggregate method stays even when a policy engine exists.
+
+Rejected. The domain rule is moved into a policy call, and the aggregate is updated with a setter.
+
+```java
+if (!policy.allow(jwt, "order.cancel", orderId)) {
+    throw new ResponseStatusException(HttpStatus.FORBIDDEN);
+}
+order.setStatus(Status.CANCELLED);
+```
+
+### Secrets
+
+The platform vault injects secrets as environment variables with no default (section 16). The service does not add a HashiCorp Vault client or an AWS Secrets Manager client, does not store a secret in a static field, and does not sign JWTs. Validation uses the issuer's JWKS. Rotation happens in the vault; the process restarts with the new value.
+
+Passwords, tokens, card numbers, national identifiers, and connection strings are not logged, not put in exceptions, and not put in Problem Details. SQL goes through JPA or Spring's parameter binding. Do not concatenate a request value into SQL, JPQL, or a native query. Do not add a parser for XML from external users without saying so in the change.
+
+### Image, network, and catalog
+
+These files exist so a service cannot be deployed as an undocumented root process on a flat network. They are evidence for SOC 2, ISO 27001, PCI-DSS, and GDPR reviews. The service does not claim a certification in code, comments, or the catalog.
+
+The image is a current Eclipse Temurin 25 JRE. Production replaces the tag with a digest. The process user is `10001:10001`. The image contains the jar, not the source, not a secret, and not a package manager invocation. Maven `finalName` is `app`, so the copy has one source file.
+
+```dockerfile
+FROM eclipse-temurin:25-jre
+WORKDIR /app
+RUN groupadd --system --gid 10001 app \
+    && useradd --system --uid 10001 --gid 10001 --no-create-home app
+COPY target/app.jar app.jar
+USER 10001:10001
+EXPOSE 8080
+ENTRYPOINT ["java", "-jar", "/app/app.jar"]
+```
+
+`deploy/network-policy.yaml` is default deny. Ingress `8080` comes only from the gateway namespace. Ingress `8081` comes only from the monitoring namespace. Egress is DNS, PostgreSQL, the named downstreams, the broker when this feature publishes, and the OTLP collector. The database policy, owned with the database, accepts `5432` only from this service. Replace the placeholder label with the platform's namespace label. Do not also add a Cilium policy.
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: order-service
+spec:
+  podSelector:
+    matchLabels:
+      app: order-service
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              policy.company/name: gateway
+      ports:
+        - protocol: TCP
+          port: 8080
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              policy.company/name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8081
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              policy.company/name: data
+      ports:
+        - protocol: TCP
+          port: 5432
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              policy.company/name: payments
+      ports:
+        - protocol: TCP
+          port: 443
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              policy.company/name: telemetry
+      ports:
+        - protocol: TCP
+          port: 4318
+```
+
+`catalog-info.yaml` registers the service before it is reachable. Do not add a Backstage plugin to the Java app.
+
+```yaml
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: order-service
+  description: Takes and cancels orders
+spec:
+  type: service
+  lifecycle: production
+  owner: team-orders
+  system: commerce
+```
+
+### Supply chain
+
+CI produces a CycloneDX SBOM with `org.cyclonedx:cyclonedx-maven-plugin` and scans the image with Trivy. A HIGH or CRITICAL finding that has a fixed version fails the pipeline. The bump is its own change. Do not also add Snyk or OWASP Dependency-Check. Dependencies are still reviewed when added (section 21).
+
+| Other write-up | What we generate |
+| --- | --- |
+| The gateway already authenticated the user | `SecurityConfig` above. The service validates the JWT |
+| Istio or Linkerd resources inside this repo | The platform mesh. This repo ships a `NetworkPolicy` |
+| OPA or Oso for the first authorization rule | `@PreAuthorize` for the authority, the aggregate for the business rule |
+| A Vault or Secrets Manager SDK | Environment variables injected by the platform vault |
+| Snyk, Trivy, and Dependency-Check together | Trivy plus one CycloneDX SBOM |
+| A Cilium policy and a `NetworkPolicy` | One `NetworkPolicy` |
+| A Backstage plugin in the service | `catalog-info.yaml` |
 
 ## 18. Logging and observability
+
+Logs go to stdout and stderr only. The platform collector reads them. There is no log file in the image and no vendor log API in the service.
 
 - SLF4J, one logger per class: `private static final Logger log = LoggerFactory.getLogger(CreateOrderService.class);`
 - Parameterized messages. No string concatenation in the call.
 - INFO for a state change that an operator would search for. DEBUG for diagnostic detail. WARN for a rejected business action. ERROR for a failed operation a human must notice.
 - Include the aggregate id. Include a stable event phrase at the start of the message (`Order placed.`).
-- Production logs are ECS JSON via `logging.structured.format.console=ecs`. Trace and span ids come from Micrometer Tracing / OpenTelemetry. The problem body echoes `traceId` when MDC has it.
-- Custom metrics use Micrometer and a lowercase dot name: `orders.placed`, with a `result` tag of `success` or `failure`. Do not put high-cardinality values (raw ids, emails) in tags.
-- Health distinguishes liveness and readiness. Readiness fails when the database is unreachable.
+- Where each failure is logged is section 10. A business rejection is WARN without a stack. An unexpected exception is ERROR with a stack, once, in `ApiExceptionHandler`. The HTTP body still has no exception text (section 12).
+
+Production logs are ECS JSON via `logging.structured.format.console=ecs`. `service.name` comes from `spring.application.name`. Micrometer Tracing puts `traceId` and `spanId` on the MDC, and the ECS formatter writes those MDC keys into the JSON. The problem body echoes `traceId` when the MDC has it.
+
+The correlation id is that `traceId`. The gateway propagates W3C `traceparent`. The injected `RestClient.Builder` and the message relay continue the same trace (section 15). Do not generate `X-Correlation-ID`, and do not add a filter whose job is to invent one.
+
+Accepted.
+
+```java
+log.info("Order placed. orderId={}", order.id().value());
+```
+
+Rejected. A concatenated message, a token, a card, an email, and a body dump.
+
+```java
+log.error("Payment failed for " + email + " token " + authorization + " card " + cardNumber);
+log.info("Request body {}", request);
+```
+
+Leave these values out of the message, the MDC, and the exception text: `Authorization`, `Cookie`, `Set-Cookie`, passwords, access tokens, card numbers, national identifiers, emails, and raw request or response bodies. An audit line may include the JWT `sub` as `enduser.id`. It does not include the email. A masking utility that regex-scans log lines is the wrong shape. Do not pass the secret in the first place.
+
+Do not log a properties object (section 16).
+
+| Hand-rolled field | ECS field we already emit |
+| --- | --- |
+| `timestamp` | `@timestamp` |
+| `level` | `log.level` |
+| `service_name` | `service.name` |
+| `message` | `message` |
+| `correlation_id` | `traceId` from the MDC |
+| `exception` | the stack on the single ERROR log for an unexpected failure |
+
+Traces use `spring-boot-starter-opentelemetry` and export OTLP. The platform sets `management.opentelemetry.tracing.export.otlp.endpoint`. The jar does not hardcode that URL. Sampling in the jar stays `0.1`. Do not add Zipkin, Jaeger, Sleuth, a vendor SDK, or a Logback OpenTelemetry appender. Logs stay on stdout.
+
+Custom metrics use Micrometer and a lowercase dot name: `orders.placed`, with a `result` tag of `success` or `failure`. Do not put high-cardinality values (raw ids, emails) in tags. Prometheus is scraped from `8081`. Health distinguishes liveness and readiness. Readiness fails when the database is unreachable.
+
+A custom span uses `ObservationRegistry` in the application service. The observation name is lowercase and dotted, the same way as a metric. The domain does not take the registry.
 
 ## 19. Testing
 
@@ -1876,7 +2105,8 @@ Approved for a standard service:
 | `spring-boot-starter-security-oauth2-resource-server` | JWT |
 | `spring-boot-starter-actuator` | Health and metrics |
 | `spring-boot-starter-micrometer-metrics` | Metrics |
-| `spring-boot-starter-opentelemetry` | When the platform traces |
+| `spring-boot-starter-opentelemetry` | OTLP traces. Required. The platform sets the endpoint. |
+| `org.cyclonedx:cyclonedx-maven-plugin` | Build plugin. One SBOM. Not a compile dependency. |
 | `spring-boot-starter-restclient` | Outbound HTTP |
 | `org.springdoc:springdoc-openapi-starter-webmvc-ui` 3.2.x | OpenAPI. Not managed by the Boot BOM. |
 | `org.mapstruct:mapstruct` and `mapstruct-processor` | Current stable release that supports Java 25. Not managed by the Boot BOM. |
@@ -1899,6 +2129,7 @@ Not approved:
 - A CRUD generator, a generic repository framework, or a base-controller library.
 - `spring-boot-properties-migrator` in a service that was born on Boot 4. It is a migration aid, not a runtime dependency.
 - google-java-format, the Eclipse Java formatter, or Checkstyle used as a second layout. Spotless with Palantir is the formatter (section 20).
+- Spring Cloud Gateway, a Vault or Secrets Manager client, an Open Policy Agent or Oso client on the first authorization rule, `spring-boot-starter-zipkin`, a Jaeger client, and a second log encoder. Section 17 and section 18 name the single control for each.
 
 A library outside this list is a visible decision in the change description. The agent does not add it silently.
 
@@ -1906,7 +2137,7 @@ A library outside this list is a visible decision in the change description. The
 
 Before writing code:
 
-1. Read section 2 and section 5. If the change adds or alters an endpoint, read section 11 before writing the controller.
+1. Read section 2 and section 5. If the change adds or alters an endpoint, read section 11 before writing the controller. Read section 17 before authentication, authorization, secrets, or a deploy file, and section 18 before a log line.
 2. Find the feature package. Name it with the grouping algorithm. Do not create a parallel tree.
 3. List the files you will add, each with its layer, and check them against the table in section 5. Choose the path, method, status, cache header, and link relations from section 11. Do not invent a second URL or error style.
 4. Reuse the starter types in `shared.error` and `shared.web`. Do not create a second exception hierarchy or a second page wrapper.
@@ -1918,6 +2149,7 @@ While writing code:
 - A service stays concrete, public, not final, and stateless. Copy the accepted transaction method, not the Lombok and `@Autowired` example.
 - Names use section 7 (`OrderId`, not `OrderID`). Member order follows section 5. Format with `mvn spotless:apply`. Palantir's `PALANTIR` style is the layout. Google's 2-space style and Oracle's 80-column style are not.
 - Configuration is a validated `@ConfigurationProperties` record from section 16. Do not add `@Value`.
+- The service validates the JWT. `@PreAuthorize` checks one authority. The aggregate keeps the business rule. Do not add a gateway, a mesh, a vault client, OPA, Oso, Zipkin, or `X-Correlation-ID`.
 - Do not add an interface to an application service. Do not add a `Utils`, `Helper`, or base class to satisfy a principle.
 - Do not put `@Entity` on a domain type.
 - Do not "improve" unrelated code, reformat the repository, or upgrade the framework inside a feature change.
@@ -1954,7 +2186,10 @@ If a rule cannot be followed, say which rule and why. Do not quietly start a sec
 - [ ] Constructor injection. No `@Value`, no field injection, no Lombok.
 - [ ] Time comes from `Clock`. Money is `BigDecimal`. Ids are value objects.
 - [ ] The required test from section 19 exists and fails if the new behavior is removed.
-- [ ] Outbound clients have timeouts. Logs have no secrets.
+- [ ] The service validates the bearer JWT. `permitAll` is only health and info, plus springdoc on `local`. `@PreAuthorize` checks an authority. The business rule stays on the aggregate.
+- [ ] Secrets are platform-injected environment variables. The image runs as `10001:10001`. `catalog-info.yaml` and a default-deny `NetworkPolicy` exist for a new service.
+- [ ] Outbound clients use the injected `RestClient.Builder`, `https`, and timeouts. Certificate checks stay on.
+- [ ] Logs are ECS JSON on stdout with the Micrometer `traceId`. No token, card, email, or body is logged.
 - [ ] Boot 4 artifact and import names are the ones in section 3.
 - [ ] `mvn spotless:check` passes on the Palantir `PALANTIR` profile from section 20 (four spaces, no second formatter). `mvn test` and the relevant `*IT` were run for the change.
 
