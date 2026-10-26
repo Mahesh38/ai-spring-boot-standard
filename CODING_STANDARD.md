@@ -12,7 +12,7 @@ Humans review against the checklist in section 23.
 Agents follow this order:
 
 1. Section 2, then the Boot 4 trap table in section 3.
-2. Section 5, and place every new file before writing it.
+2. Section 5, and place every new file before writing it. Name it with section 7, and keep the member order from section 5. Section 20 is the only layout.
 3. Section 8 before introducing a class. Copy an accepted snippet. For any HTTP endpoint, read section 11 before choosing the path, method, status, or headers. Then read the layer section for the code you are about to write (sections 10–15).
 4. Section 19, and write the tests with the production code.
 5. Section 23 before you finish.
@@ -44,6 +44,7 @@ Examples use `com.company.orderservice`. Replace `company` with the organization
 - The service is a stateless OAuth2 resource server. Authenticate every route except the health and info probes.
 - Logs are structured. They contain the aggregate id and the trace id. They never contain secrets, tokens, or raw credentials.
 - Design choices match the accepted snippets in section 8. A principle is not a reason to add a service interface, a `Utils` class, a setter-only model, or a base class.
+- Names use the four shapes in section 7. Layout is Palantir Java Format: four-space indent, 120-character lines, explicit imports. Google's two-space style and Oracle's 80-column style are not used.
 - A new library must be on the approved list in section 21, or the change must say why and a human must accept it.
 
 ## 3. Technology baseline
@@ -161,7 +162,7 @@ indent_style = space
 indent_size = 4
 ```
 
-`.gitignore` includes `application-local.yml`, `.env`, and IDE metadata. Secrets never go in git.
+`indent_size = 4` matches Palantir. Leave it at 4. `.gitignore` includes `application-local.yml`, `.env`, and IDE metadata. Secrets never go in git.
 
 ## 5. Package layout and file grouping
 
@@ -191,6 +192,65 @@ Feature-specific `@Configuration` and `@ConfigurationProperties` live in `{featu
 6. A type moves to `shared/{bucket}` only when it is technical and a second feature already needs it, or when it is on the starter list below.
 7. One primary type per file. A record used by only one parent stays nested in that parent.
 8. Stop. Do not create a package for a pattern name, a layer name at the root, or a hypothetical future feature.
+
+### Order inside a source file
+
+The algorithm above chooses the file. This list is the order inside it. Palantir (section 20) formats whitespace and sorts imports. It does not reorder members, so the author writes this order.
+
+1. A license header only when this service already has one. Do not invent a copyright banner.
+2. The `package` statement.
+3. Imports, one type per line. The formatter's order is the standard: static imports, one blank line, then every other import in ASCII order (`com` before `java`). No star import (`java.util.*`) and no `import module`.
+4. Exactly one top-level type. A record, exception, or builder used only by that type stays nested in it.
+
+Class members, top to bottom:
+
+1. `static final` constants, on the type that uses them.
+2. Instance fields. Collaborators are `private final` and are not assigned again after the constructor.
+3. Constructors.
+4. The type's behavior. Each public method is followed by the private helpers that exist only for it.
+5. Nested types.
+
+Group methods by the job they do. A file-wide sort of every `public` method, then every `private` method, separates a use case from the helper that only it calls.
+
+| Type | Method order |
+| --- | --- |
+| Controller | `POST` collection, `GET` collection, `GET` item, `PUT`, `PATCH`, action `POST`s, `DELETE` |
+| Aggregate | static factories, then mutators, then queries |
+| Application service | constructor, the one use-case method, then its private helpers |
+| Test | the success path, then each rejection |
+
+Accepted. One top-level type, imports in ASCII order, then fields and the constructor:
+
+```java
+package com.company.orderservice.order.application;
+
+import com.company.orderservice.order.domain.OrderRepository;
+import java.util.Objects;
+
+public class CancelOrderService {
+    private final OrderRepository orders;
+
+    public CancelOrderService(OrderRepository orders) {
+        this.orders = Objects.requireNonNull(orders);
+    }
+}
+```
+
+The use-case method follows the constructor, and a private helper follows the method that uses it. The `cancel` body itself is the one in section 10.
+
+Rejected. A star import, a static import below the other imports, two top-level types, and a constant holder:
+
+```java
+import java.util.*;
+
+import static java.util.Objects.requireNonNull;
+
+class CancelOrderService {}
+
+class OrderConstants {
+    static final int MAX_ATTEMPTS = 3;
+}
+```
 
 ### Where a new file goes
 
@@ -282,9 +342,20 @@ An application service is a concrete class. It gets an interface only when a sec
 
 ## 7. Naming
 
+Four shapes cover every name we invent. An acronym inside one of those names is a word: `OrderId`, `ApiLinks`, `HttpHeaders`, `JsonBody`, `Url`. `OrderID`, `APILinks`, `HTTPHeaders`, and `JSONBody` are the wrong shape. Types from the JDK and from libraries keep the spelling they were published with (`UUID`, `URI`, `HttpClient`).
+
+| Kind | Shape | Accepted | Rejected |
+| --- | --- | --- | --- |
+| Class, interface, record, enum | UpperCamelCase noun or noun phrase | `OrderProcessor`, `CreateOrderService` | `orderProcessor`, `Order_Processor` |
+| Method, parameter, field, local | lowerCamelCase | `calculateTotal()`, `findUserById()` | `CalculateTotal()`, `find_user_by_id()` |
+| Constant (`static final`, enum constant) | UPPER_SNAKE_CASE | `MAX_RETRY_ATTEMPTS`, `DEFAULT_TIMEOUT` | `maxRetryAttempts` |
+| Package | lowercase, dot-separated, no underscores | `com.company.orderservice.order` | `com.company.orderService`, `com.company.orderservice.utility` |
+
+A method starts with a verb. A type is a noun. A constant is `static final` on the type that uses the value. There is no `Constants` class, and `utility` is not a package (section 5).
+
 ### Packages and files
 
-- Packages are lowercase singular nouns. No underscores, no acronyms in mixed case.
+- Packages are lowercase singular nouns. No underscores, no mixed-case acronyms.
 - The file name is the public type name. One primary type per file.
 - `package-info.java` on the feature root states the capability in one sentence.
 
@@ -363,7 +434,7 @@ Forbidden type names: `IOrderRepository`, `OrderRepositoryImpl`, `OrderServiceIm
 
 ### Tests
 
-Method name: `should{Expected}When{Condition}`.
+Method name: `should{Expected}When{Condition}`. Inside the class, the success path comes first and each rejection follows it (section 5).
 
 ```text
 shouldRejectCancellationWhenOrderIsShipped
@@ -1696,14 +1767,96 @@ Keep ArchUnit on a release that can read the class-file version of the service J
 
 - Java 25. Records, switch expressions, text blocks, pattern matching, and `var` are welcome. Use `var` when the right-hand side shows the type (`var order = Order.place(...)`). Do not use `var` when the type is a numeric literal or an unclear method result.
 - Unnamed variables (`_`) are fine for an unused lambda parameter.
-- No raw types, no wildcard imports, no star static imports.
+- No raw types, no wildcard imports, no star static imports, no `import module`.
 - Prefer the JDK to a utility library. `String.isBlank`, `List.copyOf`, `Objects.requireNonNull`, and `Optional` cover most needs.
 - Comments explain a business or regulatory constraint that the code cannot say. They do not narrate the next line. Commented-out code is deleted.
 - Javadoc is for a port, a public domain method whose contract is not obvious, and a properties type. It is not required on every getter.
-- Format with the Spotless Maven plugin and Palantir Java Format. Run `mvn spotless:apply` before committing. CI runs `mvn spotless:check`. Do not hand-wrap code to fight the formatter, and do not mix a repo-wide format into a behavior change.
-- Encoding is UTF-8. Line endings are LF. Indent is four spaces. Files end with a newline.
+- Encoding is UTF-8. Line endings are LF. Files end with a newline. Indent is four spaces, which is the Palantir block indent below.
 
 The Maven Enforcer plugin bans these dependencies: `org.projectlombok:lombok`, `com.h2database:h2`, `org.modelmapper:modelmapper`, `junit:junit`, and `org.springframework.boot:spring-boot-starter-web`.
+
+### One layout
+
+Palantir Java Format, style `PALANTIR`, is the only layout. Spotless runs it. The style has no settings we change. When this section was written the pair was Spotless Maven plugin 3.10.4 and Palantir 2.102.0. Bump the two together in a dedicated change, the same way section 3 bumps the Boot parent.
+
+| Rule | What we write |
+| --- | --- |
+| Block indent | 4 spaces. The `.editorconfig` value stays 4. |
+| Continuation | 8 more spaces from the start of the statement being continued |
+| Line length | 120 characters |
+| Call chain | One call per line when the text before the last `.` would pass column 80, even when the whole statement would fit in 120 |
+| Braces | Kernighan and Ritchie: `{` on the same line as the statement, `}` alone on the following line, aligned with that statement |
+| Control flow | Braces on every `if`, `else`, `for`, `while`, and `do`, including a body of one line. The formatter does not insert a missing pair, so the author writes them |
+| Operators | One space on each side of a binary operator, including `=`, `+`, `-`, `*`, `&&`, and `\|\|` |
+| Keywords | One space between `if`, `for`, `while`, `switch`, or `catch` and the `(` |
+| Wrapping | Break before `.` and before `+`. The break belongs to the operator that continues the expression |
+| Strings | A literal past column 120 is split between words, with `+` at the start of the next line |
+| Imports | Static imports, one blank line, then every other import in ASCII order. Unused imports are removed. Member order inside the type is section 5, which the formatter leaves alone |
+| Javadoc | Left as written. `formatJavadoc` stays false |
+
+Accepted:
+
+```java
+if (user.isActive()) {
+    int sum = a + b;
+    sendNotification(user);
+}
+```
+
+Rejected. Missing spaces, a tab indent, and a braceless body:
+
+```java
+if(user.isActive())
+	sendNotification(user);
+int sum=a+b;
+```
+
+These other layouts are not a second standard:
+
+| Other guide | What an agent must not copy |
+| --- | --- |
+| Google Java Style | 2-space indent, 100-character lines, `<style>GOOGLE</style>` |
+| Oracle Code Conventions | 80-character lines, a second indent width |
+| Eclipse / IntelliJ default scheme | Import groups split into `java`, `javax`, `org`, and `com`, or Ctrl+Alt+L / Cmd+Option+L against that scheme |
+| AOSP | `<style>AOSP</style>` |
+| Checkstyle, google-java-format, Eclipse formatter | A second tool that restates layout. Architecture checks stay in ArchUnit (section 19) |
+
+A Gradle service uses plugin `com.palantir.java-format` at the same Palantir version. The IntelliJ or Eclipse Palantir plugin is that same version. `mvn spotless:apply` is what CI checks. Run it before committing. Do not mix a repo-wide format into a behavior change. When a formatted line reads badly, extract a local or a small method. The next format run keeps that extraction. Hand-wrapping to fight the formatter does not survive `spotless:check`.
+
+```xml
+<plugin>
+    <groupId>com.diffplug.spotless</groupId>
+    <artifactId>spotless-maven-plugin</artifactId>
+    <version>3.10.4</version>
+    <configuration>
+        <java>
+            <palantirJavaFormat>
+                <version>2.102.0</version>
+                <style>PALANTIR</style>
+                <formatJavadoc>false</formatJavadoc>
+            </palantirJavaFormat>
+            <forbidWildcardImports />
+            <forbidModuleImports />
+        </java>
+    </configuration>
+    <executions>
+        <execution>
+            <goals>
+                <goal>check</goal>
+            </goals>
+            <phase>verify</phase>
+        </execution>
+    </executions>
+</plugin>
+```
+
+Leave these steps out of the plugin. Each one fights Palantir:
+
+- `<style>GOOGLE</style>` or `<style>AOSP</style>`.
+- `<googleJavaFormat>`, `<eclipse>`, or `<idea>`.
+- An `<indent>` step. Palantir already indents with 4 spaces, and a later indent step rewrites them to 2.
+- `<importOrder>` with `java|javax|org|com`. Palantir already sorts imports.
+- A `<licenseHeader>` on a service that does not already have a header.
 
 ## 21. Dependencies
 
@@ -1733,6 +1886,7 @@ Approved for a standard service:
 | `org.springframework.boot:spring-boot-testcontainers` | Scope test |
 | `org.testcontainers:testcontainers-junit-jupiter` and `testcontainers-postgresql` | Scope test, versions from the BOM |
 | `com.tngtech.archunit:archunit` | Scope test. Current release that reads Java 25 bytecode. |
+| `com.diffplug.spotless:spotless-maven-plugin` | Build plugin, not a compile dependency. Palantir style, section 20. |
 
 Not approved:
 
@@ -1744,6 +1898,7 @@ Not approved:
 - Spring HATEOAS (`spring-boot-starter-hateoas`). Links are the `Link` record in section 11.5.
 - A CRUD generator, a generic repository framework, or a base-controller library.
 - `spring-boot-properties-migrator` in a service that was born on Boot 4. It is a migration aid, not a runtime dependency.
+- google-java-format, the Eclipse Java formatter, or Checkstyle used as a second layout. Spotless with Palantir is the formatter (section 20).
 
 A library outside this list is a visible decision in the change description. The agent does not add it silently.
 
@@ -1761,6 +1916,7 @@ While writing code:
 
 - Match the canonical shapes in section 10 and the accepted snippets in section 8. Same annotations, same constructor injection, same mapping split.
 - A service stays concrete, public, not final, and stateless. Copy the accepted transaction method, not the Lombok and `@Autowired` example.
+- Names use section 7 (`OrderId`, not `OrderID`). Member order follows section 5. Format with `mvn spotless:apply`. Palantir's `PALANTIR` style is the layout. Google's 2-space style and Oracle's 80-column style are not.
 - Configuration is a validated `@ConfigurationProperties` record from section 16. Do not add `@Value`.
 - Do not add an interface to an application service. Do not add a `Utils`, `Helper`, or base class to satisfy a principle.
 - Do not put `@Entity` on a domain type.
@@ -1793,13 +1949,14 @@ If a rule cannot be followed, say which rule and why. Do not quietly start a sec
 - [ ] Paths, methods, statuses, pagination, `ETag`, `Cache-Control`, and `links` match section 11. `PUT` and `PATCH` require `If-Match`.
 - [ ] Resource URIs come from `ApiLinks` and the public base URL. The body has no view-model labels and no executable content.
 - [ ] A schema change is a new immutable Flyway migration, and `ddl-auto` remains `validate`.
-- [ ] Names match section 7. Source types have no `Impl`, no `I` prefix, no `DTO`, and no `Utils`. MapStruct's generated `{Mapper}Impl` is the only exception.
+- [ ] Names match section 7, including the four shapes (`OrderId`, not `OrderID`). Source types have no `Impl`, no `I` prefix, no `DTO`, and no `Utils`. MapStruct's generated `{Mapper}Impl` is the only exception.
+- [ ] The file follows section 5: explicit imports, one top-level type, constants, fields, constructor, then behavior. A constant sits on the owning type.
 - [ ] Constructor injection. No `@Value`, no field injection, no Lombok.
 - [ ] Time comes from `Clock`. Money is `BigDecimal`. Ids are value objects.
 - [ ] The required test from section 19 exists and fails if the new behavior is removed.
 - [ ] Outbound clients have timeouts. Logs have no secrets.
 - [ ] Boot 4 artifact and import names are the ones in section 3.
-- [ ] `mvn spotless:check`, `mvn test`, and the relevant `*IT` were run for the change.
+- [ ] `mvn spotless:check` passes on the Palantir `PALANTIR` profile from section 20 (four spaces, no second formatter). `mvn test` and the relevant `*IT` were run for the change.
 
 ## 24. Worked example
 
