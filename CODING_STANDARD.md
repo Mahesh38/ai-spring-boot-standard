@@ -13,7 +13,7 @@ Agents follow this order:
 
 1. Section 2, then the Boot 4 trap table in section 3.
 2. Section 5, and place every new file before writing it. Name it with section 7, and keep the member order from section 5. Section 20 is the only layout.
-3. Section 8 before introducing a class. Copy an accepted snippet. For any HTTP endpoint, read section 11 before choosing the path, method, status, or headers. Read section 17 before authentication, authorization, secrets, or a deploy file, and section 18 before adding a log line. Then read the layer section for the code you are about to write (sections 10–15).
+3. Section 8 before introducing a class. Copy an accepted snippet. A new condition on an existing flow follows section 8.17. For any HTTP endpoint, read section 11 before choosing the path, method, status, or headers. Read section 17 before authentication, authorization, secrets, or a deploy file, and section 18 before adding a log line. Then read the layer section for the code you are about to write (sections 10–15).
 4. Section 19, and write the tests with the production code.
 5. Section 23 before you finish.
 
@@ -48,6 +48,7 @@ Examples use `com.company.orderservice`. Replace `company` with the organization
 - Design choices match the accepted snippets in section 8. A principle is not a reason to add a service interface, a `Utils` class, a setter-only model, or a base class.
 - Names use the four shapes in section 7. Layout is Palantir Java Format: four-space indent, 120-character lines, explicit imports. Google's two-space style and Oracle's 80-column style are not used.
 - A new library must be on the approved list in section 21, or the change must say why and a human must accept it.
+- A new condition on a flow that already has a rule list is a new class and a new test. The use-case body stays as it is. Posted money and binding decisions are insert-only. A request path does not load an unbounded table.
 
 ## 3. Technology baseline
 
@@ -278,6 +279,7 @@ class OrderConstants {
 | A technical type already needed by a second feature | `shared/error` or `shared/web` |
 | A scheduled job | `{feature}/infrastructure/{Job}Job.java` calling an application service |
 | A cross-cutting servlet filter | `shared/web` |
+| A new condition on a flow that already has a rule list | a new `{Condition}Rule` in `{feature}/domain`, plus one line in the existing `@Bean` list. The use-case method is not edited |
 | The service catalog entry | `catalog-info.yaml` at the repository root |
 | Who may open a connection to this process | `deploy/network-policy.yaml` |
 | The image user and the jar entrypoint | `Dockerfile` at the repository root |
@@ -777,6 +779,70 @@ Encapsulation still allows a getter used by a mapper. The getter returns an immu
 3. Does a behavior already exist on the aggregate? Call it. Do not copy the `if` into the controller.
 4. Are you adding this type because the current use case needs it? If the reason is "later," stop.
 5. Does the new type's name end in `Utils`, `Helper`, `Manager`, `Impl`, or `Base`? Rename it to the job, or delete it and move the method onto the type that owns the data.
+6. Is this a new condition on a flow that already has a rule list? Add a rule class. Do not add a branch to the use case. Section 8.17.
+
+### 8.17 Adding a condition to an existing flow
+
+A new feature on a new capability is a new package (section 5). A new condition on a flow that already exists is a smaller change than that, and it stays small on purpose.
+
+The aggregate keeps the invariants of its own state. `Order.cancel` still rejects a shipped order. That check does not move into a strategy.
+
+Conditions that arrive over time, and that are not the aggregate's own state machine, become a rule list at the third condition. Eligibility, pricing, limits, fees, sanctions, and disclosures are this kind of list. The business already expects another rule next quarter. Two conditions stay ordinary branches, as in section 8.2. The third condition is the last time the use case is restructured.
+
+After that, the use case depends on `List<PlaceOrderRule>` and does not grow. Each rule is one class and one test. A new condition adds the class, the test, and one line in the `@Bean` method that builds the list. The controller, the API, the other rules, and the body of the use case stay untouched.
+
+A pure rule lives in `domain` and sees facts the use case already loaded. It does not call HTTP, does not touch JPA, and does not save. A rule that needs another system implements the same interface in `application` and calls a port.
+
+Accepted. The third pricing condition, and every one after it.
+
+```java
+public interface PlaceOrderRule {
+    void check(OrderDraft draft);
+}
+
+public final class SanctionedPartyRule implements PlaceOrderRule {
+    @Override
+    public void check(OrderDraft draft) {
+        if (draft.party().isSanctioned()) {
+            throw new SanctionedPartyException(draft.party().id());
+        }
+    }
+}
+
+@Configuration(proxyBeanMethods = false)
+class PlaceOrderRuleConfig {
+    @Bean
+    List<PlaceOrderRule> placeOrderRules() {
+        return List.of(new MinimumLineRule(), new SanctionedPartyRule());
+    }
+}
+```
+
+```java
+public Order place(PlaceOrderCommand command) {
+    OrderDraft draft = OrderDraft.from(command);
+    rules.forEach(rule -> rule.check(draft));
+    return orders.save(Order.place(new OrderId(UUID.randomUUID()), draft.lines(), clock.instant()));
+}
+```
+
+The `forEach` line is written once. `SanctionedPartyRule` does not edit `MinimumLineRule`. `SanctionedPartyException` extends `BusinessRuleException` with code `sanctioned-party`.
+
+Rejected. The use case gains another branch, and the next regulation will edit it again.
+
+```java
+if (draft.country().equals("US")) {
+    checkUsLimit(draft);
+} else if (draft.country().equals("DE")) {
+    checkDeLimit(draft);
+} else if (draft.party().isSanctioned()) {
+    throw new SanctionedPartyException(draft.party().id());
+}
+```
+
+A permanent rule is not a feature flag. A kill switch is a standard exception in the service README with a review date, not a boolean per condition in `application.yml`.
+
+A calculation that was shown to a customer, or an amount that was posted, stores the rule id, the effective date, and the money that was produced. A later rule change inserts a new decision. It does not update the stored amount. Replaying yesterday's quote uses yesterday's decision.
 
 ## 9. Design patterns
 
@@ -788,7 +854,7 @@ Use a pattern when the problem it solves is present. Name the type for the busin
 | Repository | An aggregate is loaded and saved | `OrderRepository` in `domain`, adapter in `infrastructure/persistence` |
 | Adapter | The service calls a database, a broker, or another HTTP API | `PaymentClientAdapter` |
 | Factory method | Construction has invariants or a meaning | `Order.place(...)`. A separate factory class only when construction needs collaborators. |
-| Policy | A business rule does not naturally live on one entity | `CancellationPolicy` in `domain`, called by the aggregate or the application service |
+| Policy | A condition is not the aggregate's own state machine, and a third condition has arrived or the business already treats the set as a list | One `{Flow}Rule` class per condition. The use case takes `List<{Flow}Rule>` from one `@Bean`. Section 8.17 |
 | Strategy | Three or more interchangeable algorithms, chosen at runtime | A small interface in the feature that owns the variation, one type per algorithm |
 | Domain event | Another feature, or another service, must react, and a direct call would couple them or cycle | Record in `domain`, published by the application service |
 | Transactional outbox | A message must commit atomically with the database write | Table and relay in `infrastructure/messaging` |
@@ -1325,7 +1391,7 @@ Cursor pagination is the default. Use it for any collection that grows, is appen
 
 ### 11.9 Idempotency-Key
 
-A `POST` that creates a resource and can be retried requires `Idempotency-Key`. The same key and the same body return the original status and body. The same key and a different body return 409. The key is stored in the same transaction as the aggregate. One implementation serves the whole service. Features do not each invent a store.
+A `POST` that creates a resource and can be retried requires `Idempotency-Key`. The same key and the same body return the original status and body. The same key and a different body return 409. The key is stored in the same transaction as the aggregate. The second call does not append a second posted amount. One implementation serves the whole service. Features do not each invent a store.
 
 ### 11.10 Versioning
 
@@ -1428,6 +1494,20 @@ One `@RestControllerAdvice` exists: `ApiExceptionHandler`. A feature adds an exc
 - A breaking column change follows expand then contract: add the new column, backfill, switch the code, drop the old column in a later release.
 - Optimistic locking is the default for updates. The API expresses it as `ETag` and `If-Match` (section 11.7). A lost update maps `ObjectOptimisticLockingFailureException` to 412. Pessimistic locks require a comment in the adapter naming the contention they prevent.
 - The transaction boundary is the application-service method. Default propagation is `REQUIRED`.
+- A posted amount or a binding decision is insert-only. The repository for that table has no update and no delete. A correction inserts a reversing fact. A migration does not rewrite those rows. Personal data can be separated from the fact so an erasure request does not delete the financial record. The platform retention schedule owns how long the fact is kept.
+- The previous version of the service must still start after a migration. A new column is nullable or has a default. Dropping or renaming a column is the contract step, in a later release, after no running version reads it.
+
+### Hot paths
+
+Efficiency here means a request does a bounded amount of work. It does not mean a cleverer algorithm for a method that runs once.
+
+- A request path does not call `findAll`, and it does not load a row in a loop. A list is the paged query from section 11, or one query whose predicate matches the use case.
+- A screen that does not change the aggregate reads a view or a projection. It does not load the aggregate and ignore most of it.
+- Associations stay `LAZY`. The one query that needs a child uses a join fetch or an `@EntityGraph` on that repository method. `FetchType.EAGER` stays forbidden.
+- A new filter or sort column ships the index in the same migration. The index name follows section 7.
+- Child rows of one aggregate use JDBC batching. `hibernate.jdbc.batch_size` is 50, with `order_inserts` and `order_updates` enabled. The batch size is not a reason to hold the transaction open across a remote call.
+- The jar does not set Hikari `maximum-pool-size`. The platform sets it from the database connection budget.
+- Reference data with an effective date may be cached. The cache key includes that date, and the entry has a TTL. A balance, a remaining limit, a bindable quote, and an authorization decision are loaded from the database on each use. A stale money figure is a defect.
 
 ## 14. Time, money, and identifiers
 
@@ -1435,8 +1515,42 @@ One `@RestControllerAdvice` exists: `ApiExceptionHandler`. A feature adds an exc
 - Tests that care about time pass `Clock.fixed(...)`.
 - The domain does not call `LocalDateTime.now()` or `new Date()`.
 - `Instant` is a moment. `LocalDate` is a civil date. `LocalDateTime` is not a timestamp and is not stored as one.
-- Money is a `Money` record of `BigDecimal` plus `Currency`. Never `double` or `float`. Rounding happens in a named domain method with an explicit `RoundingMode`.
+- Money is a `Money` record of `BigDecimal` plus `Currency`. Never `double` or `float`. Never `new BigDecimal(double)`. Parse a decimal from a string or build it from an integer scale.
+- The scale is 4, matching `numeric(19, 4)`. The rounding mode for a new service is `RoundingMode.HALF_EVEN`, a named constant on `Money`. A product rule that requires another mode passes that mode into the operation. A service method does not call `setScale` on its own.
+- Two amounts add only when the currency is the same. Sameness is `compareTo == 0`. `BigDecimal.equals` treats `10.0` and `10.00` as different, so it is not the money comparison.
+- A rate, a limit, or a product term has `effectiveFrom` inclusive and `effectiveTo` exclusive. The calculation takes the business date of the event, not "now", when the event happened earlier. A new rate is a new row. The previous row's amount stays as it was.
 - Identifiers are records. The raw `UUID` appears at the HTTP boundary and in the JPA entity, not as the field type of an aggregate.
+
+```java
+public record Money(BigDecimal amount, Currency currency) {
+    public static final int SCALE = 4;
+    public static final RoundingMode ROUNDING = RoundingMode.HALF_EVEN;
+
+    public Money {
+        Objects.requireNonNull(amount, "amount");
+        Objects.requireNonNull(currency, "currency");
+        amount = amount.setScale(SCALE, ROUNDING);
+    }
+
+    public Money add(Money other) {
+        if (!currency.equals(other.currency)) {
+            throw new IllegalArgumentException("currency");
+        }
+        return new Money(amount.add(other.amount), currency);
+    }
+
+    public boolean sameAmount(Money other) {
+        return currency.equals(other.currency) && amount.compareTo(other.amount) == 0;
+    }
+}
+```
+
+Rejected. A `double` premium, and `equals` on the unscaled decimal.
+
+```java
+double premium = 19.99;
+boolean same = left.amount().equals(right.amount());
+```
 
 ## 15. Calls to other services
 
@@ -1547,6 +1661,9 @@ spring:
       ddl-auto: validate
     properties:
       hibernate.jdbc.time_zone: UTC
+      hibernate.jdbc.batch_size: 50
+      hibernate.order_inserts: true
+      hibernate.order_updates: true
   flyway:
     enabled: true
   jackson:
@@ -1691,6 +1808,8 @@ order.setStatus(Status.CANCELLED);
 ### Secrets
 
 The platform vault injects secrets as environment variables with no default (section 16). The service does not add a HashiCorp Vault client or an AWS Secrets Manager client, does not store a secret in a static field, and does not sign JWTs. Validation uses the issuer's JWKS. Rotation happens in the vault; the process restarts with the new value.
+
+A posted amount and a binding decision follow the insert-only rule in section 13. The application log is not the book of record. An erasure request removes or separates personal attributes. It does not delete the posted fact.
 
 Passwords, tokens, card numbers, national identifiers, and connection strings are not logged, not put in exceptions, and not put in Problem Details. SQL goes through JPA or Spring's parameter binding. Do not concatenate a request value into SQL, JPQL, or a native query. Do not add a parser for XML from external users without saying so in the change.
 
@@ -1851,6 +1970,8 @@ Tests follow the production package. They use JUnit Jupiter, AssertJ, and Mockit
 | Production change | Test |
 | --- | --- |
 | Domain rule | `{Type}Test`, plain JUnit, no Spring. Cover the failure and the success. |
+| A new condition on an existing rule list | A unit test of that rule only. The other rules' tests stay as they are. |
+| Money arithmetic | Scale, a second currency, and `compareTo`. `10.0` and `10.00` compare as the same amount. |
 | Application branching and port interaction | `{Type}Test` with Mockito. No Spring context. |
 | HTTP status, validation, JSON shape, `self` link, `ETag`, and `Cache-Control` | `{Controller}Test` with `@WebMvcTest` and `@MockitoBean` for the application services |
 | Repository adapter, queries, and migrations | `{Type}IT` with `@DataJpaTest`, Testcontainers PostgreSQL, `@AutoConfigureTestDatabase(replace = Replace.NONE)`, `@ServiceConnection` |
@@ -2254,6 +2375,7 @@ While writing code:
 - A service stays concrete, public, not final, and stateless. Copy the accepted transaction method, not the Lombok and `@Autowired` example.
 - Names use section 7 (`OrderId`, not `OrderID`). Member order follows section 5. Format with `mvn spotless:apply`. Palantir's `PALANTIR` style is the layout. Google's 2-space style and Oracle's 80-column style are not.
 - Carriers are records. Checks use `Objects`, `String.isBlank`, and `List.of`. Mapping is the MapStruct mapper in section 10. Do not add Lombok, Commons Lang, Guava, or `BeanUtils`.
+- A new condition on a flow that already has a rule list is a new rule class and one line in the existing `@Bean` list (section 8.17). Money uses `Money`. A request path does not call `findAll` or query once per row.
 - Configuration is a validated `@ConfigurationProperties` record from section 16. Do not add `@Value`.
 - The service validates the JWT. `@PreAuthorize` checks one authority. The aggregate keeps the business rule. Do not add a gateway, a mesh, a vault client, OPA, Oso, Zipkin, or `X-Correlation-ID`.
 - Do not add an interface to an application service. Do not add a `Utils`, `Helper`, or base class to satisfy a principle.
@@ -2291,7 +2413,9 @@ If a rule cannot be followed, say which rule and why. Do not quietly start a sec
 - [ ] The file follows section 5: explicit imports, one top-level type, constants, fields, constructor, then behavior. A constant sits on the owning type.
 - [ ] Constructor injection. No `@Value`, no field injection, no Lombok (`@Builder`, `@Data`, `@Getter`, `@Setter`, `@RequiredArgsConstructor`).
 - [ ] Null, blank, and collection code uses the JDK. MapStruct uses `MappingConstants.ComponentModel.SPRING` and `ReportingPolicy.ERROR`. No Commons Lang, Guava, or `BeanUtils`. A JPA `toString` prints the id only.
-- [ ] Time comes from `Clock`. Money is `BigDecimal`. Ids are value objects.
+- [ ] Time comes from `Clock`. Money is `Money`: scale 4, `HALF_EVEN`, `compareTo`, one currency, built from a string or an integer. Ids are value objects.
+- [ ] A new condition on an existing rule list adds a class and a test. The use-case body is unchanged. A posted amount or a binding decision is insert-only, and it records the rule id and the effective date.
+- [ ] A request path is paged or is one query. A new filter has an index in the same migration. A balance, a limit, or an authorization is not cached.
 - [ ] The required test from section 19 exists and fails if the new behavior is removed.
 - [ ] The service validates the bearer JWT. `permitAll` is only health and info, plus springdoc on `local`. `@PreAuthorize` checks an authority. The business rule stays on the aggregate.
 - [ ] Secrets are platform-injected environment variables. The image runs as `10001:10001`. `catalog-info.yaml` and a default-deny `NetworkPolicy` exist for a new service.
