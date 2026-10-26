@@ -37,7 +37,8 @@ Examples use `com.company.orderservice`. Replace `company` with the organization
 - Schema changes are Flyway migrations. `ddl-auto` is `validate`. `open-in-view` is `false`.
 - `@Transactional` sits on the application service. Query methods are `readOnly = true`.
 - Persistence tests run against PostgreSQL in Testcontainers. H2 is not a dependency.
-- No Lombok, no `@Value`, no `@MockBean`, no `@SpyBean`, no `I` prefix, no `Impl` suffix, no `util` or `helper` or `common` package.
+- No Lombok (`@Data`, `@Getter`, `@Setter`, `@Builder`, `@RequiredArgsConstructor`), no `@Value`, no `@MockBean`, no `@SpyBean`, no `I` prefix, no `Impl` suffix, no `util` or `helper` or `common` package. A field count does not turn a record into a builder.
+- Null checks, blank checks, and collections use the JDK. Mapping is MapStruct. `BeanUtils`, Commons Lang, and Guava are not used.
 - Mapping between layers is MapStruct. Injected JSON mapping uses the Boot auto-configured Jackson 3 `JsonMapper`.
 - A behavior change ships with the test type in section 19. The ArchUnit test stays green.
 - Outbound HTTP has a connect timeout and a read timeout.
@@ -408,7 +409,7 @@ Forbidden type names: `IOrderRepository`, `OrderRepositoryImpl`, `OrderServiceIm
 - Booleans read as predicates: `isCancelled`, `hasLines`, `canCancel`. The field does not repeat `flag`.
 - Methods and parameters are camelCase. No Hungarian notation.
 - Collections are never null. Return `List.of()` or an empty page. Do not return null from a domain or application method.
-- `Optional` is a return type for a single absent value. It is not a field, not a parameter, and not a collection wrapper.
+- `Optional` is the return type when a single value may be absent. A method that always has a result returns the value. `Optional` is not a field, not a parameter, and not a wrapper around a collection.
 
 ### HTTP
 
@@ -793,7 +794,7 @@ Use a pattern when the problem it solves is present. Name the type for the busin
 | Transactional outbox | A message must commit atomically with the database write | Table and relay in `infrastructure/messaging` |
 | Anti-corruption | An external payload must not become our domain language | Mapping inside the client adapter. Our ports speak our types. |
 | Specification | A query predicate is reused by several use cases and has business meaning | A domain type that the persistence adapter translates. One repository method is enough for a single query. |
-| Builder | A value has many optional parts and a compact constructor has become unreadable | A builder on that type. Four fields or fewer stay a record constructor. |
+| Builder | A value has many optional parts and a compact constructor has become unreadable | A builder written on that type. A record stays a record at any field count. Lombok `@Builder` is not used. |
 
 Patterns we do not use:
 
@@ -807,6 +808,7 @@ Patterns we do not use:
 | Layer-first root packages | Spread one change across the tree and defeat the grouping rules |
 | Domain events for a private call inside one use case | A method call is clearer |
 | Repository exposed as `JpaRepository` outside infrastructure | Leaks `deleteAll`, flush, and vendor types |
+| Lombok `@Builder`, `@Data`, `@Getter`, `@Setter`, `@ToString` | The library is banned. Records and accessors written on the type cover these jobs. |
 
 CQRS, in the form we use, means separate command and query services inside the same feature and the same database. It does not mean event sourcing, a second database, or a framework. Add those only through a change to this standard.
 
@@ -884,6 +886,9 @@ The command is its own file. It carries domain types, never a request record.
 
 ```java
 public record CreateOrderCommand(List<OrderLine> lines) {
+    public CreateOrderCommand {
+        lines = List.copyOf(Objects.requireNonNull(lines, "lines"));
+    }
 }
 ```
 
@@ -972,6 +977,8 @@ What that snippet gets wrong, and the replacement:
 | Blog habit | What we generate |
 | --- | --- |
 | `@RequiredArgsConstructor` | The constructor written in the class. Lombok stays banned. |
+| Lombok `@Builder` once a carrier has more than three fields | A record, however many required components it has. A hand-written builder only when section 9 says the constructor is unreadable. |
+| `@Getter`, `@Setter`, and `@ToString` on a JPA entity | Accessors written on the entity. `toString` prints the id only. `equals` and `hashCode` use the id. |
 | A service interface plus `OrderServiceImpl` for one implementation | The concrete `CancelOrderService`. An interface appears only for a port, or for a strategy that already has a second implementation. |
 | The service accepts `CreateOrderRequest` or returns `OrderResponse` | It accepts a command and returns the aggregate or a view. The controller maps HTTP. |
 | The service returns `OrderJpaEntity` | The entity never leaves `infrastructure`. `open-in-view` is false, so a lazy load in the controller would throw, not hide. |
@@ -1089,17 +1096,51 @@ interface OrderJpaRepository extends Repository<OrderJpaEntity, UUID> {
 
 JPA entities are package-private, live next to the adapter, and are a storage model. `FetchType.LAZY` is the default. `FetchType.EAGER` is not used. `@Version` is a `long` on any aggregate that can be updated. `@Enumerated(EnumType.STRING)`. No `CascadeType.ALL` unless the children are part of the same aggregate and are saved only through the root.
 
-Equality of a JPA entity is by id, and only for a non-null id. Do not put entities in a `HashSet` before they have ids.
+Accessors are written on the entity. There is no Lombok annotation on it. `equals` and `hashCode` use the id, and only a non-null id. `toString` prints the id and no association, so a log cannot initialize a lazy collection or cycle through a parent. Do not put entities in a `HashSet` before they have ids.
+
+Rejected. `@Data`, and the "safer" Lombok set that still pulls the banned library onto the classpath.
+
+```java
+@Entity
+@Getter
+@Setter
+@ToString(exclude = "lines")
+class OrderJpaEntity {}
+```
 
 ### Mapping
 
-MapStruct does the mapping. `componentModel = "spring"`. `unmappedTargetPolicy = ReportingPolicy.ERROR`.
+MapStruct does the mapping. The generated implementation is a Spring bean. Unmapped targets fail compilation.
+
+```java
+@Mapper(
+        componentModel = MappingConstants.ComponentModel.SPRING,
+        unmappedTargetPolicy = ReportingPolicy.ERROR)
+interface OrderPersistenceMapper {
+
+    OrderJpaEntity toEntity(Order order);
+
+    Order toDomain(OrderJpaEntity entity);
+
+    default UUID toUuid(OrderId id) {
+        return id.value();
+    }
+}
+```
 
 - `OrderApiMapper` in `api` maps request ↔ command and domain ↔ response.
 - `OrderPersistenceMapper` in `infrastructure/persistence` maps domain ↔ JPA entity.
 - The two mappers do not call each other.
-- A default method on the mapper may unwrap an `OrderId`. Do not hand-write a second mapping style beside MapStruct.
+- A default method on the mapper may unwrap an `OrderId`. That is the only handwritten conversion.
 - MapStruct names its generated class `{Mapper}Impl`. That generated name is the one exception to the no-`Impl` rule. Source types still use the names in section 7.
+- Records and written accessors are the mapping source. There is no Lombok builder for MapStruct to call.
+
+Rejected. A reflection copy, or a second mapper written by hand.
+
+```java
+OrderJpaEntity entity = new OrderJpaEntity();
+BeanUtils.copyProperties(order, entity);
+```
 
 ### Visibility
 
@@ -1979,6 +2020,20 @@ class LayeringArchTest {
     }
 
     @Test
+    void noThirdPartyUtilityLibraries() {
+        noClasses()
+                .should().dependOnClassesThat().resideInAnyPackage(
+                        "org.apache.commons.lang3..",
+                        "org.apache.commons.beanutils..",
+                        "com.google.common..")
+                .check(classes);
+        noClasses()
+                .should().dependOnClassesThat()
+                .haveFullyQualifiedName("org.springframework.beans.BeanUtils")
+                .check(classes);
+    }
+
+    @Test
     void noFieldInjection() {
         noFields()
                 .should().beAnnotatedWith(Autowired.class)
@@ -1997,12 +2052,62 @@ Keep ArchUnit on a release that can read the class-file version of the service J
 - Java 25. Records, switch expressions, text blocks, pattern matching, and `var` are welcome. Use `var` when the right-hand side shows the type (`var order = Order.place(...)`). Do not use `var` when the type is a numeric literal or an unclear method result.
 - Unnamed variables (`_`) are fine for an unused lambda parameter.
 - No raw types, no wildcard imports, no star static imports, no `import module`.
-- Prefer the JDK to a utility library. `String.isBlank`, `List.copyOf`, `Objects.requireNonNull`, and `Optional` cover most needs.
+- The JDK is the utility library. The rules and the rejected substitutes are in "JDK first" below.
 - Comments explain a business or regulatory constraint that the code cannot say. They do not narrate the next line. Commented-out code is deleted.
 - Javadoc is for a port, a public domain method whose contract is not obvious, and a properties type. It is not required on every getter.
 - Encoding is UTF-8. Line endings are LF. Files end with a newline. Indent is four spaces, which is the Palantir block indent below.
 
-The Maven Enforcer plugin bans these dependencies: `org.projectlombok:lombok`, `com.h2database:h2`, `org.modelmapper:modelmapper`, `junit:junit`, and `org.springframework.boot:spring-boot-starter-web`.
+The Maven Enforcer plugin bans these dependencies: `org.projectlombok:lombok`, `com.h2database:h2`, `org.modelmapper:modelmapper`, `junit:junit`, `org.springframework.boot:spring-boot-starter-web`, `org.apache.commons:commons-lang3`, and `com.google.guava:guava`.
+
+### JDK first
+
+Basic checks and carriers use the JDK. A third-party utility is not added to replace a method Java already has.
+
+| Need | What we write |
+| --- | --- |
+| Null check, fallback, or equality | `Objects.requireNonNull`, `Objects.requireNonNullElse`, `Objects.equals` |
+| Blank or empty text, after the null check | `String.isBlank`, `String.isEmpty` |
+| A fixed collection | `List.of`, `Set.of`, `Map.of` |
+| A stream collected to a list | `Stream.toList` |
+| A defensive copy | `List.copyOf` |
+| A shallow immutable carrier | A `record`, at any number of components |
+| A value that may be absent | `Optional` from `find`. The caller uses `orElseThrow` or `orElseGet`. |
+| A closed set of alternatives | An enum, or a record. Not `Map<String, Object>` and not a stringly key. |
+
+Accepted.
+
+```java
+public record Sku(String value) {
+    public Sku {
+        value = Objects.requireNonNullElse(value, "");
+        if (value.isBlank()) {
+            throw new IllegalArgumentException("value");
+        }
+    }
+}
+```
+
+`isBlank` runs after `requireNonNullElse`, so the receiver is not null. A lookup that may miss returns `Optional`. A lookup that must exist uses `orElseThrow`. Neither returns null.
+
+Rejected. A utility library, a null return, a reflection copy, and a Lombok builder standing in for a record.
+
+```java
+if (StringUtils.isBlank(sku)) {
+    return null;
+}
+List<OrderLine> copy = ImmutableList.copyOf(lines);
+BeanUtils.copyProperties(request, new OrderJpaEntity());
+```
+
+```java
+@Builder
+@Getter
+public class CreateOrderCommand {
+    private List<OrderLine> lines;
+}
+```
+
+A hand-written builder is the section 9 case only: many optional parts, and the compact constructor has become unreadable. Four required fields are still a record.
 
 ### One layout
 
@@ -2120,7 +2225,7 @@ Approved for a standard service:
 
 Not approved:
 
-- Lombok, ModelMapper, Dozer, MapStruct's old `mapstruct-jdk8` artifact.
+- Lombok, ModelMapper, Dozer, Spring `BeanUtils`, Apache Commons Lang, Apache Commons BeanUtils, Guava, and MapStruct's old `mapstruct-jdk8` artifact. The JDK methods in section 20 cover those jobs.
 - H2.
 - `RestTemplate` for new clients. An existing client may stay until a change touches it, and that change converts it to `RestClient`.
 - WebFlux in an MVC service.
@@ -2148,6 +2253,7 @@ While writing code:
 - Match the canonical shapes in section 10 and the accepted snippets in section 8. Same annotations, same constructor injection, same mapping split.
 - A service stays concrete, public, not final, and stateless. Copy the accepted transaction method, not the Lombok and `@Autowired` example.
 - Names use section 7 (`OrderId`, not `OrderID`). Member order follows section 5. Format with `mvn spotless:apply`. Palantir's `PALANTIR` style is the layout. Google's 2-space style and Oracle's 80-column style are not.
+- Carriers are records. Checks use `Objects`, `String.isBlank`, and `List.of`. Mapping is the MapStruct mapper in section 10. Do not add Lombok, Commons Lang, Guava, or `BeanUtils`.
 - Configuration is a validated `@ConfigurationProperties` record from section 16. Do not add `@Value`.
 - The service validates the JWT. `@PreAuthorize` checks one authority. The aggregate keeps the business rule. Do not add a gateway, a mesh, a vault client, OPA, Oso, Zipkin, or `X-Correlation-ID`.
 - Do not add an interface to an application service. Do not add a `Utils`, `Helper`, or base class to satisfy a principle.
@@ -2183,7 +2289,8 @@ If a rule cannot be followed, say which rule and why. Do not quietly start a sec
 - [ ] A schema change is a new immutable Flyway migration, and `ddl-auto` remains `validate`.
 - [ ] Names match section 7, including the four shapes (`OrderId`, not `OrderID`). Source types have no `Impl`, no `I` prefix, no `DTO`, and no `Utils`. MapStruct's generated `{Mapper}Impl` is the only exception.
 - [ ] The file follows section 5: explicit imports, one top-level type, constants, fields, constructor, then behavior. A constant sits on the owning type.
-- [ ] Constructor injection. No `@Value`, no field injection, no Lombok.
+- [ ] Constructor injection. No `@Value`, no field injection, no Lombok (`@Builder`, `@Data`, `@Getter`, `@Setter`, `@RequiredArgsConstructor`).
+- [ ] Null, blank, and collection code uses the JDK. MapStruct uses `MappingConstants.ComponentModel.SPRING` and `ReportingPolicy.ERROR`. No Commons Lang, Guava, or `BeanUtils`. A JPA `toString` prints the id only.
 - [ ] Time comes from `Clock`. Money is `BigDecimal`. Ids are value objects.
 - [ ] The required test from section 19 exists and fails if the new behavior is removed.
 - [ ] The service validates the bearer JWT. `permitAll` is only health and info, plus springdoc on `local`. `@PreAuthorize` checks an authority. The business rule stays on the aggregate.

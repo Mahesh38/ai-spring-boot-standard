@@ -15,6 +15,7 @@ Until the file is open, follow these constraints:
 - Java 25, Spring Boot 4.1.x, imperative MVC via `spring-boot-starter-webmvc`.
 - Records for requests, responses, commands, views, and value objects. Aggregates are classes.
 - Constructor injection. No Lombok, no field injection, no `@Value`, no `@MockBean`, no `I` prefix, no `Impl` suffix.
+- JDK utilities only: `Objects`, `String.isBlank`, `List.of`, `Stream.toList`. Records stay records at any field count. MapStruct uses `MappingConstants.ComponentModel.SPRING`. No Commons Lang, Guava, `BeanUtils`, or Lombok `@Builder`, `@Data`, `@Getter`, or `@Setter`.
 - `@Transactional` on the application service. Flyway for schema. `ddl-auto: validate`. Problem Details for errors.
 - Persistence tests use Testcontainers PostgreSQL. H2 is forbidden.
 - Application services are concrete, public, not final, and stateless. Constructor injection is written out. `@Transactional` sits on the public service method. Configuration is a validated `@ConfigurationProperties` record, not `@Value` and not Lombok.
