@@ -13,7 +13,7 @@ Agents follow this order:
 
 1. Section 2, then the Boot 4 trap table in section 3.
 2. Section 5, and place every new file before writing it.
-3. The layer section for the code you are about to write (sections 10–15). For any HTTP endpoint, read section 11 before choosing the path, method, status, or headers.
+3. Section 8 before introducing a class. Copy an accepted snippet. For any HTTP endpoint, read section 11 before choosing the path, method, status, or headers. Then read the layer section for the code you are about to write (sections 10–15).
 4. Section 19, and write the tests with the production code.
 5. Section 23 before you finish.
 
@@ -43,6 +43,7 @@ Examples use `com.company.orderservice`. Replace `company` with the organization
 - Outbound HTTP has a connect timeout and a read timeout.
 - The service is a stateless OAuth2 resource server. Authenticate every route except the health and info probes.
 - Logs are structured. They contain the aggregate id and the trace id. They never contain secrets, tokens, or raw credentials.
+- Design choices match the accepted snippets in section 8. A principle is not a reason to add a service interface, a `Utils` class, a setter-only model, or a base class.
 - A new library must be on the approved list in section 21, or the change must say why and a human must accept it.
 
 ## 3. Technology baseline
@@ -371,39 +372,331 @@ shouldReturn404WhenOrderDoesNotExist
 
 ## 8. Design principles
 
-These are rules for where code goes, not slogans.
+Principles decide where a behavior lives. They are not permission to add a class. Patterns in section 9 are the blueprints. This section is the judgment.
 
-**Dependency rule.** Inner layers do not know outer layers. Section 6 is the enforceable form.
+When a principle and a slogan from a blog disagree with an accepted snippet here, the snippet wins. In particular:
 
-**Single responsibility.** A class changes for one reason. A type that validates HTTP, applies a price rule, and writes SQL is three types in three layers. A method that needs a comment to separate two phases is two methods.
+- "Program to an interface" does not mean an interface for every service.
+- "Open/closed" and "prefer polymorphism" do not mean a strategy for two branches.
+- "DRY" does not mean a `Utils` or `Helper` class.
+- "Encapsulation" does not mean a public setter for every field.
+- "Inheritance for reuse" does not mean `BaseService` or `AbstractAdapter`.
+- A command in an application service may return the aggregate or its id. It does not return an HTTP response, and a query does not save.
 
-**Open/closed, in practice.** Add a new strategy type when a third variant appears. A two-branch `if` stays an `if`. Do not introduce a strategy, a factory, and an interface for two cases.
+Before introducing a type, name the principle you are applying and match its accepted snippet. If the new type is a service interface with one implementation, a `*Utils` class, a base class, or a setter-only aggregate, do not generate it.
 
-**Liskov.** Every implementation of a port honors the same failures. If `OrderRepository.findById` returns an empty `Optional` when the row is missing, no adapter throws a vendor exception for that case instead.
+### 8.1 Single responsibility
 
-**Interface segregation.** A repository port exposes the methods the use cases need, typically `save` and `findById`, plus a specific finder when a use case needs it. Query screens that are not aggregate edits use a query port that returns a view. They do not add reporting methods to the aggregate repository.
+A class changes for one reason. HTTP mapping, a business rule, and SQL are three types in three layers.
 
-**Dependency inversion.** Domain and application own the interfaces. Infrastructure implements them. Spring injecting a concrete adapter into the service is the inversion. `ApplicationContext.getBean` is not.
+Accepted. The controller maps, the service orchestrates, the aggregate protects the invariant, the adapter stores.
 
-**Fail fast.** An aggregate, a value object, and an identifier cannot be constructed in an invalid state. Check at the constructor. Do not repair bad data deep in a call chain.
+```java
+public Order create(CreateOrderCommand command) {
+    Order order = Order.place(new OrderId(UUID.randomUUID()), command.lines(), clock.instant());
+    return orders.save(order);
+}
+```
 
-**Command-query separation.** A command method changes state and returns the aggregate or its id. A query method does not change state. Writes and reads are different application services when both exist. One service with a single `create` method does not also grow a `list`.
+Rejected. One class validates the body, computes a total, and calls JPA. It has three reasons to change.
 
-**Tell, don't ask.** The application service tells the aggregate `order.cancel(reason)`. It does not copy the status out, decide, and copy a new status in. Getters exist for mapping and for tests, not for exporting decisions.
+```java
+@RestController
+class OrderController {
+    @PostMapping
+    OrderResponse create(CreateOrderRequest request) {
+        if (request.lines().isEmpty()) {
+            throw new BadRequestException("bad-request", "Order requires a line");
+        }
+        var total = request.lines().stream().map(Line::price).reduce(Money.ZERO, Money::add);
+        return new OrderResponse(jpa.save(new OrderJpaEntity(total)).getId(), total);
+    }
+}
+```
 
-**Law of Demeter.** A caller uses the object it has. It does not walk `order.customer().address().country()` to make a policy decision. That decision is a method on the aggregate or a domain policy that receives the values it needs.
+### 8.2 Open/closed
 
-**Composition over inheritance.** Do not inherit to reuse code. No `BaseService`, no `AbstractAdapter`. Extend a type only for a closed domain hierarchy that is a true is-a, and keep it to one level. Prefer a port plus an adapter.
+Extend behavior by adding a type when a third variant appears. Until then, a branch stays a branch. Closed means you do not edit the existing carriers to add a new one. It does not mean you may never edit a class that has a bug.
 
-**YAGNI.** Do not add a layer, a cache, a message, an interface, or a feature package for a need that is not in the current change. The repository interface and the client interface are required by the dependency rule. An interface for `CreateOrderService` is not.
+Accepted while there are two carriers:
 
-**DRY, after the third copy.** Duplicate a small mapping or a small value object once rather than create the wrong abstraction. On the third copy, extract it to the owning feature or to `shared` using the admission test.
+```java
+Money quote(Order order, Carrier carrier) {
+    return switch (carrier) {
+        case ROAD -> roadRate(order);
+        case AIR -> airRate(order);
+    };
+}
+```
 
-**Explicit dependencies.** Everything a class needs is a constructor parameter. No static service lookup, no field injection, no hidden `new` of an outbound client inside a method.
+Accepted once a third carrier is required. The interface lives in `domain` when the rate is a function of the order, and in `application` when it calls a carrier. Implementations are Spring beans outside `domain`. A new carrier is a new class. The other carriers stay untouched. `UnsupportedCarrierException` extends `BusinessRuleException`.
 
-**Least surprise.** Status codes match section 12. Names match section 7. A reader should predict the package from the type name.
+```java
+public interface ShippingQuote {
+    boolean supports(Carrier carrier);
+    Money quote(Order order);
+}
 
-**Small use cases.** One application-service method is one transaction and one reason for the user to call the service. Multi-step workflows call several use cases or a domain method. They do not become a 400-line service.
+public Money quote(Order order, Carrier carrier) {
+    return quotes.stream()
+            .filter(quote -> quote.supports(carrier))
+            .findFirst()
+            .orElseThrow(() -> new UnsupportedCarrierException(carrier))
+            .quote(order);
+}
+```
+
+Rejected. A subclass, or a strategy plus a factory, introduced for the second carrier.
+
+```java
+class AirCreateOrderService extends CreateOrderService { }
+```
+
+### 8.3 Liskov substitution
+
+Anything that claims to be a port or a parent type must honor that contract, including the failures. Callers substitute it without a special case.
+
+Accepted. Every `OrderRepository` returns an empty `Optional` when the id is absent. `OrderNotFoundException` is a `NotFoundException`, so the handler still answers 404.
+
+```java
+public Optional<Order> findById(OrderId id) {
+    return jpa.findById(id.value()).map(mapper::toDomain);
+}
+```
+
+Rejected. One adapter throws a vendor "row not found" exception for the case the port defines as empty. Callers grow an `if (adapter instanceof ...)` check, and the parent contract is a lie.
+
+```java
+public Optional<Order> findById(OrderId id) {
+    OrderJpaEntity entity = jpa.findById(id.value()).orElseThrow(EntityNotFoundException::new);
+    return Optional.of(mapper.toDomain(entity));
+}
+```
+
+### 8.4 Interface segregation
+
+A client depends on the methods it calls. The aggregate repository stays small. A screen that is not editing the aggregate gets its own query port.
+
+Accepted.
+
+```java
+public interface OrderRepository {
+    Order save(Order order);
+    Optional<Order> findById(OrderId id);
+}
+
+public interface OrderViewQuery {
+    OffsetPage<OrderView> list(OrderSearch search, PageRequest page);
+}
+```
+
+Rejected. One fat port. The write service now depends on reporting and export methods it must not call.
+
+```java
+public interface OrderRepository {
+    Order save(Order order);
+    Optional<Order> findById(OrderId id);
+    List<Order> findByCustomer(CustomerId id);
+    Money revenue(Year year);
+    byte[] exportCsv();
+    void deleteAll();
+}
+```
+
+### 8.5 Dependency inversion
+
+High-level code owns the abstraction. Low-level code implements it. Spring injecting the adapter into the service is the inversion.
+
+Accepted. `CreateOrderService` asks for `OrderRepository`. The JPA adapter is the only class that sees `OrderJpaRepository`.
+
+```java
+public CreateOrderService(OrderRepository orders, Clock clock) {
+    this.orders = orders;
+    this.clock = clock;
+}
+```
+
+Rejected. The use case constructs or declares the persistence adapter. The domain rule now depends on JDBC.
+
+```java
+public CreateOrderService(OrderJpaRepository jpa) {
+    this.jpa = jpa;
+}
+```
+
+`ApplicationContext.getBean` and a static `OrderRepositoryHolder` are the same mistake.
+
+### 8.6 Program to an interface
+
+Use an abstract type at the boundary that has more than one implementation, or that exists to keep the dependency rule. Use `List`, not `ArrayList`, in a signature. The application service itself stays a concrete class.
+
+Accepted.
+
+```java
+public final class Order {
+    public static Order place(OrderId id, List<OrderLine> lines, Instant now) {
+        return new Order(id, lines, now, OrderStatus.PLACED);
+    }
+}
+```
+
+Rejected. An interface with one implementation, and a concrete collection type in the API.
+
+```java
+public interface CreateOrderService {
+    Order create(CreateOrderCommand command);
+}
+
+public class CreateOrderServiceImpl implements CreateOrderService { }
+
+void place(ArrayList<OrderLine> lines) { }
+```
+
+### 8.7 DRY, after the third copy
+
+A rule lives in one place. Two copies of a ten-line value object may wait. The third copy moves to the type that owns the concept, or to `shared` when the admission test in section 5 passes.
+
+Accepted. "A shipped order cannot be cancelled" is only inside `Order.cancel`. The controller, the mapper, and the tests call that method. They do not restate the rule.
+
+Rejected. A helper that exists because two lines looked similar, and a second copy of the business rule in the controller.
+
+```java
+public final class OrderUtils {
+    public static boolean canCancel(String status) {
+        return "PLACED".equals(status);
+    }
+}
+```
+
+### 8.8 KISS and YAGNI
+
+The smallest design that satisfies the current use case is the one to generate. A repository port and a client port are required by section 6. A cache, a message bus, a generic pipeline, and an interface "for later" are not.
+
+Accepted. `Order.place` checks its invariant and returns. No interceptor chain, no factory registry.
+
+Rejected. `CachingOrderRepositoryDecorator`, `OrderCreatedEvent`, and `CreateOrderService` as an interface, added in the same change as the first `POST /orders` because a later feature might want them.
+
+### 8.9 Composition over inheritance
+
+A collaborator is a field. Inheritance is for a true is-a that stays substitutable (section 8.3), one level deep. The exception hierarchy is that case. Reuse is not.
+
+Accepted.
+
+```java
+public final class CancelOrderService {
+    private final OrderRepository orders;
+
+    public CancelOrderService(OrderRepository orders) {
+        this.orders = orders;
+    }
+}
+
+public final class OrderNotFoundException extends NotFoundException {
+    public OrderNotFoundException(OrderId id) {
+        super("order-not-found", "Order " + id.value() + " was not found");
+    }
+}
+```
+
+Rejected.
+
+```java
+public abstract class AbstractCrudService<T> { }
+
+public class CancelOrderService extends CreateOrderService { }
+```
+
+### 8.10 Law of Demeter
+
+A method talks to its fields, its parameters, and the objects it creates. It does not walk a graph to make a decision that belongs on the aggregate.
+
+Accepted. The service tells the aggregate. The rule stays in `Order.cancel`, the method in section 10.
+
+```java
+public Order cancel(CancelOrderCommand command) {
+    Order order = orders.findById(command.orderId())
+            .orElseThrow(() -> new OrderNotFoundException(command.orderId()));
+    order.cancel(command.reason());
+    return orders.save(order);
+}
+```
+
+Rejected.
+
+```java
+if (!order.customer().shippingAddress().country().allows(order.lines().getFirst().sku())) {
+    throw new OrderCancellationRejectedException(order.id());
+}
+```
+
+If the decision needs data from two aggregates, pass those values into a `CancellationPolicy` in `domain`. Do not reach through both graphs from the service.
+
+### 8.11 Encapsulate what changes
+
+What varies gets a name and a boundary. What is stable stays a straight method. The payment provider varies. The use case that places an order does not.
+
+Accepted. `PaymentClient` is the port. `AdyenPaymentClient` and `StripePaymentClient` are the adapters. `CreateOrderService` calls `payments.authorize(...)`.
+
+Rejected. `CreateOrderService` contains the HTTP details of both providers, and a new provider edits that service.
+
+### 8.12 Cohesion and coupling
+
+A feature package is cohesive: everything in `order` is about orders. Coupling between features is a call to the other feature's application service.
+
+Accepted. `shipment` calls `CancelOrderService` or `OrderQueryService`. It does not import `OrderJpaEntity`.
+
+Rejected. `ShipmentController` injects `OrderJpaRepository`, or one `CommerceService` places orders, ships them, and issues invoices.
+
+### 8.13 Command-query separation
+
+A command changes state. A query returns data and does not change state. They are different application services when both exist.
+
+A command may return the aggregate or its id. The caller needs the id, the version, and the new state for the HTTP representation, and a second query inside the same request is not required. A command does not return `OrderResponse`. A query does not call `save`.
+
+Accepted.
+
+```java
+@Transactional
+public Order create(CreateOrderCommand command) {
+    return orders.save(Order.place(new OrderId(UUID.randomUUID()), command.lines(), clock.instant()));
+}
+
+@Transactional(readOnly = true)
+public Order get(OrderId id) {
+    return orders.findById(id).orElseThrow(() -> new OrderNotFoundException(id));
+}
+```
+
+Rejected. `getOrCreate`, a query method that updates a "last viewed" column as a side effect, and `create` returning `ResponseEntity<OrderResponse>`.
+
+### 8.14 Fail fast
+
+An invalid value is rejected at the boundary that first sees it. The domain constructor rejects an illegal object. The request record rejects a malformed body. Nothing downstream repairs a null id.
+
+Accepted. `OrderId` and `Order.place` throw before `save` is reached.
+
+Rejected. `Order.place` returns null when `lines` is empty, and the service null-checks three calls later.
+
+### 8.15 The four object-oriented tools
+
+Use each tool for the job below. The textbook reason to inherit, "so we can reuse fields," is the rejected use.
+
+| Tool | Where we use it | Accepted shape | Rejected shape |
+| --- | --- | --- | --- |
+| Abstraction | Hide SQL, HTTP, and brokers behind a port | `OrderRepository.findById` | A controller that builds a JPQL string |
+| Encapsulation | Keep state private and change it through a business method | `order.cancel(reason)` with private fields | Public setters, or a public field `status` |
+| Inheritance | A substitutable is-a, one level | `OrderNotFoundException extends NotFoundException` | `CancelOrderService extends CreateOrderService` to reuse a field |
+| Polymorphism | Several implementations of one port, once three variants exist | `ShippingQuote` implementations chosen by `supports` | A growing `switch` that is edited for every new carrier after the third, or a subclass per HTTP endpoint |
+
+Encapsulation still allows a getter used by a mapper. The getter returns an immutable value (`List.copyOf`, a record, an enum). It is not a way for the service to reach in and change `status`.
+
+### 8.16 What the agent checks before generating a class
+
+1. Which single reason will make this class change? If there are two, split it along the layers in section 5.
+2. Is this a port with a real second implementation, or a dependency-rule boundary? If neither, it is a concrete class.
+3. Does a behavior already exist on the aggregate? Call it. Do not copy the `if` into the controller.
+4. Are you adding this type because the current use case needs it? If the reason is "later," stop.
+5. Does the new type's name end in `Utils`, `Helper`, `Manager`, `Impl`, or `Base`? Rename it to the job, or delete it and move the method onto the type that owns the data.
 
 ## 9. Design patterns
 
@@ -1333,8 +1626,8 @@ Before writing code:
 
 While writing code:
 
-- Match the canonical shapes in section 10. Same annotations, same constructor injection, same mapping split.
-- Do not add an interface to an application service.
+- Match the canonical shapes in section 10 and the accepted snippets in section 8. Same annotations, same constructor injection, same mapping split.
+- Do not add an interface to an application service. Do not add a `Utils`, `Helper`, or base class to satisfy a principle.
 - Do not put `@Entity` on a domain type.
 - Do not "improve" unrelated code, reformat the repository, or upgrade the framework inside a feature change.
 - Do not leave TODOs in place of the required test, the migration, or the error mapping.
@@ -1355,7 +1648,7 @@ If a rule cannot be followed, say which rule and why. Do not quietly start a sec
 - [ ] No new root package from the forbidden list.
 - [ ] Domain files import none of Spring, JPA, Jackson, or Servlet.
 - [ ] The controller depends on application services and a mapper only.
-- [ ] Invariants are enforced in the aggregate, not only in annotations.
+- [ ] New types match an accepted snippet in section 8. No one-implementation service interface, no `Utils` or `Helper`, no base class, no setter that skips an invariant.
 - [ ] JPA entities and Spring Data interfaces are package-private and stay in `infrastructure/persistence`.
 - [ ] Spring Data extends `Repository` and declares the methods it uses.
 - [ ] `@Transactional` is on the application service. Queries are read-only.
