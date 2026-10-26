@@ -1,0 +1,20 @@
+---
+description: Mandatory Java Spring Boot microservice coding standard. Apply before generating or changing Java, configuration, SQL, or tests.
+alwaysApply: true
+---
+
+# Java Spring Boot standard
+
+`CODING_STANDARD.md` at the repository root is the only coding standard. Read it before generating or modifying code. If this rule and that file disagree, the file wins.
+
+Until the file is open, follow these constraints:
+
+- Package by feature, then by layer: `{feature}/api`, `application`, `domain`, `infrastructure`.
+- Domain code imports neither Spring, nor Jakarta Persistence, nor Jackson, nor the Servlet API.
+- Controllers call application services only. They do not call repositories or JPA entities.
+- Java 25, Spring Boot 4.1.x, imperative MVC via `spring-boot-starter-webmvc`.
+- Records for requests, responses, commands, views, and value objects. Aggregates are classes.
+- Constructor injection. No Lombok, no field injection, no `@Value`, no `@MockBean`, no `I` prefix, no `Impl` suffix.
+- `@Transactional` on the application service. Flyway for schema. `ddl-auto: validate`. Problem Details for errors.
+- Persistence tests use Testcontainers PostgreSQL. H2 is forbidden.
+- Every behavior change ships with the test type required in section 19 of the standard.
