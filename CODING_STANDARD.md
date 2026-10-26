@@ -13,7 +13,7 @@ Agents follow this order:
 
 1. Section 2, then the Boot 4 trap table in section 3.
 2. Section 5, and place every new file before writing it.
-3. The layer section for the code you are about to write (sections 10–15).
+3. The layer section for the code you are about to write (sections 10–15). For any HTTP endpoint, read section 11 before choosing the path, method, status, or headers.
 4. Section 19, and write the tests with the production code.
 5. Section 23 before you finish.
 
@@ -32,7 +32,8 @@ Examples use `com.company.orderservice`. Replace `company` with the organization
 - Requests, responses, commands, views, identifiers, and value objects are Java records.
 - Aggregates are classes. Create them through a factory. Change them through an intention-revealing method.
 - Bean Validation guards HTTP input. The domain model still rejects an invalid state in its constructor or method.
-- Every error response is a Problem Details body. A 500 body has a generic detail and no exception text.
+- Every error response is a Problem Details body. A 500 body has a generic detail and no exception text. A failure is never HTTP 200.
+- HTTP follows section 11. Paths are plural nouns. Methods keep their HTTP meaning. JSON representations include a `self` link. Every response sets `Cache-Control`. The server stores no client session.
 - Schema changes are Flyway migrations. `ddl-auto` is `validate`. `open-in-view` is `false`.
 - `@Transactional` sits on the application service. Query methods are `readOnly = true`.
 - Persistence tests run against PostgreSQL in Testcontainers. H2 is not a dependency.
@@ -217,9 +218,10 @@ Create these with the service, not on demand inside a feature:
 
 | Type | Location |
 | --- | --- |
-| `DomainException`, `NotFoundException`, `ConflictException`, `BusinessRuleException` | `shared/error` |
+| `DomainException`, `NotFoundException`, `ConflictException`, `BusinessRuleException`, `BadRequestException`, `PreconditionRequiredException`, `PreconditionFailedException` | `shared/error` |
 | `ApiExceptionHandler` | `shared/error` |
-| `PageResponse` | `shared/web` |
+| `OffsetPage`, `CursorPage` | `shared/paging` |
+| `Link`, `ApiLinks` | `shared/web` |
 | `SecurityConfig`, `TimeConfig` | `config` |
 | `LayeringArchTest` | `src/test/java/.../architecture` |
 
@@ -258,9 +260,9 @@ infrastructure ┘
 
 | Package | May depend on | Must not depend on |
 | --- | --- | --- |
-| `domain` | Java, `shared.error` | Spring, JPA, Jackson, Servlet, `api`, `application`, `infrastructure`, `shared.web` |
-| `application` | `domain`, `shared.error`, Java | `api`, `infrastructure`, JPA, Servlet |
-| `api` | `application`, `domain` (to map), `shared.web`, `shared.error` | `infrastructure`, JPA entities |
+| `domain` | Java, `shared.error` | Spring, JPA, Jackson, Servlet, `api`, `application`, `infrastructure`, `shared.web`, `shared.paging` |
+| `application` | `domain`, `shared.error`, `shared.paging`, Java | `api`, `infrastructure`, `shared.web`, JPA, Servlet |
+| `api` | `application`, `domain` (to map), `shared.web`, `shared.paging`, `shared.error` | `infrastructure`, JPA entities |
 | `infrastructure` | the port it implements, JPA, HTTP clients, brokers | `api`, business decisions |
 | `shared.error` | Java | Spring, JPA, Jackson |
 | `config` | Spring, and the types it wires | feature internals it does not configure |
@@ -331,11 +333,11 @@ Forbidden type names: `IOrderRepository`, `OrderRepositoryImpl`, `OrderServiceIm
 ### HTTP
 
 - Base path: `/api/v1/{resources}`. Resources are plural kebab-case: `/api/v1/purchase-orders`.
-- The path names the resource. It does not start with a verb.
+- The path names the resource. It does not contain a verb. Section 11 is the full URL and method profile.
 - A state change that is not CRUD is its own resource: `POST /api/v1/orders/{orderId}/cancellations`.
 - Path variables match the Java name: `{orderId}`.
 - JSON fields are camelCase.
-- Query parameters are camelCase: `?page=0&size=20&sort=createdAt,desc`.
+- Offset queries use `?page=0&size=20&sort=createdAt,desc`. Cursor queries use `?limit=20&cursor={opaque}`. An endpoint uses one of those styles, chosen in section 11. Do not invent `page_desc` or `sort=price_desc`.
 
 ### Persistence
 
@@ -480,6 +482,7 @@ public class OrderController {
 - Do not catch domain exceptions in the controller. The shared handler maps them.
 - Do not return a domain object, a JPA entity, `Optional`, or a Spring `Page`.
 - Do not inject `OrderRepository`, `OrderJpaRepository`, or an `EntityManager`.
+- The snippet below shows the call flow. Production controllers also set the links, `Location`, `ETag`, and `Cache-Control` required by section 11. Do not ship the relative `URI.create` string; build it with `ApiLinks`.
 
 Request records carry Jakarta Validation constraints. Nested parts that belong only to that request stay nested.
 
@@ -549,7 +552,7 @@ public class OrderQueryService {
 }
 ```
 
-A query that would hydrate an aggregate only to flatten it for a screen uses a query port in `application` (`OrderViewQuery`) implemented in infrastructure. The port returns `OrderView` or `PageResponse<OrderView>`. It does not return a JPA entity.
+A query that would hydrate an aggregate only to flatten it for a screen uses a query port in `application` (`OrderViewQuery`) implemented in infrastructure. The port returns `OrderView`, `OffsetPage<OrderView>`, or `CursorPage<OrderView>`. It does not return a JPA entity, and it does not build hyperlinks. The API mapper adds links.
 
 `@Transactional` is on the application service, on the public method or on the class for a query service. It is not on the controller, not on the domain, and not on the Spring Data interface. Self-invocation does not start a transaction; do not call a `@Transactional` method of `this` and expect a new boundary.
 
@@ -685,27 +688,192 @@ Log an unexpected exception once, at ERROR, in `ApiExceptionHandler`, with the s
 Log an outbound failure once, at ERROR, in the adapter, then throw a client-safe exception.
 Do not log the same failure in the controller and the service and the handler.
 
-## 11. HTTP API
+## 11. REST API
 
-- Version in the path: `/api/v1`. A breaking change is `/api/v2` with packages `api/v1` and `api/v2` sharing one application layer. Do not fork the domain.
-- The gateway owns the service prefix. The service path starts at `/api`.
-- Unknown JSON properties are ignored so clients can evolve. Required fields are Bean Validation constraints, not a failure on unknown properties.
-- Dates and times in JSON are ISO-8601 strings. Instants are UTC. Do not emit epoch numbers.
-- Pagination input is `page`, `size`, and `sort`. Cap `size` with `spring.data.web.pageable.max-page-size: 100` and default it to 20. The response is `PageResponse`, not Spring's `Page`.
+Every controller follows this section. It is the team's REST profile: Fielding's architectural constraints, applied with the method and status rules in RFC 9110, caching in RFC 9111, Problem Details in RFC 9457, partial update in RFC 5789 and RFC 7396, and `Sunset` in RFC 8594. A blog summary does not override this section.
 
-```java
-public record PageResponse<T>(List<T> items, int page, int size, long totalElements, int totalPages) {
+Agents do not copy these shortcuts:
+
+| Shortcut | What we write instead |
+| --- | --- |
+| `POST /createNewUser`, `GET /getUserDetails?id=5` | `POST /api/v1/users`, `GET /api/v1/users/{userId}` |
+| A singular collection, `/product` | Plural collections, `/products` |
+| `/users/5/orders/12/items/3/reviews` | At most two identifiers; otherwise a filtered collection |
+| `sort=price_desc` or `?page=2&limit=50` on an offset endpoint | `sort=price,desc`. Offset uses `page` and `size`. Cursor uses `limit` and `cursor` |
+| HTTP 200 with `{ "success": false }` | The status from section 11.8 and a Problem Details body |
+| Spring HATEOAS `EntityModel` | A `links` object built by `ApiLinks` |
+| `null` in PATCH means "skip this field" | JSON Merge Patch: omitted means unchanged, `null` clears |
+| PUT creates a resource when our ids are server-generated | `POST` creates. `PUT` on a missing id is 404 |
+| JavaScript, HTML, or a screen label in the body | A JSON resource representation |
+
+### 11.1 The six constraints
+
+| Constraint | What the agent writes | What the agent does not write |
+| --- | --- | --- |
+| Uniform interface | One resource shape for the whole service: plural noun URIs, HTTP methods with the meanings below, JSON representations, and links to the next valid actions | A one-off RPC path, a second error format, or a response the client can understand only from a wiki page |
+| Client-server | The body is the resource. Clients render it | HTML, view-model labels (`statusLabel`), or a field that exists only to feed one screen |
+| Stateless | Each request carries its own `Authorization` and parameters. `SessionCreationPolicy.STATELESS` | `HttpSession`, sticky sessions, or a singleton map of "the current user" |
+| Cacheable | Every response sets `Cache-Control`. A GET of a resource also sets `ETag` | A GET that is silent about caching, or `Cache-Control: public` on an authenticated body |
+| Layered system | `Location` and links use `app.api.public-base-url`. The client cannot see pod hostnames | A link built from the internal listen address, or a problem body that names an internal service host |
+| Code on demand | Not used. This optional constraint is rejected | Executable script, HTML with script, or a body the client is expected to eval |
+
+`server.forward-headers-strategy: framework` is set so a gateway's `Forwarded` headers are visible. The public base URL still wins over those headers when it is configured, which it is in every deployed environment.
+
+### 11.2 URLs and resources
+
+- Path shape: `/api/v1/{collection}` and `/api/v1/{collection}/{id}`. Collections are plural kebab-case nouns.
+- The gateway may prefix the service. The service path still starts at `/api`.
+- No verb segment: `create`, `get`, `update`, `delete`, `list`, `search`, `cancel`, `process`.
+- No trailing slash, no `.json` suffix, no file extension.
+- A non-CRUD action is a noun sub-resource: `POST /api/v1/orders/{orderId}/cancellations`. The action name is not the path (`/cancel` is rejected).
+- Nesting stops at two identifiers. `/api/v1/orders/{orderId}/lines/{lineId}` is the deepest legal path. A third identifier becomes a query on a collection: `GET /api/v1/reviews?lineId={lineId}`.
+- A true singleton under a parent may be singular: `GET /api/v1/customers/{customerId}/profile`. A collection is never singular.
+- Identifiers in the path are the resource id, not a search field. Filters go in the query string.
+- A collection that does not exist as a route returns 404 from the framework. An empty collection that does exist returns 200 and an empty `items` array, not 404.
+
+### 11.3 Method semantics
+
+Safe means the method does not change server state. Idempotent means repeating a successful request leaves the same server state, even if a later response status differs.
+
+| Method | Use | Safe | Idempotent | Success |
+| --- | --- | --- | --- | --- |
+| `GET` | Read one resource or one page | Yes | Yes | 200, or 304 when `If-None-Match` hits |
+| `POST` | Create a resource, or run an action that is not a pure replace | No | No, unless `Idempotency-Key` makes the create retry-safe | 201 for a create, 200 for an action that returns a body, 202 only when the work is actually queued |
+| `PUT` | Replace the whole representation of an existing resource | No | Yes | 200 and the new representation |
+| `PATCH` | Partial update with JSON Merge Patch | No | Yes for our media type. Generic PATCH is not | 200 and the new representation |
+| `DELETE` | Remove the resource from the API | No | Yes | 204 |
+
+Narrowings agents must keep:
+
+- `POST` creates. Our ids are generated by the service, so `PUT` does not upsert. `PUT` against an unknown id is 404.
+- `PUT` sends every editable field. A missing field on `PUT` clears it or fails validation. It is not a partial update.
+- `PATCH` consumes `application/merge-patch+json`. Omitted members stay as they are. `null` clears a nullable member. An array in the patch replaces the whole array. Applying the same patch twice yields the same state.
+- A state change with its own rules (`cancel`, `submit`, `refund`) is a `POST` to an action collection, not a `PATCH` that hides the rule in a status string.
+- `DELETE` means a later `GET` returns 404. History may remain in the database as a terminal state, but the public resource is gone. A second `DELETE` returns 404. The server state does not change again.
+- Do not use `GET` with a body, and do not use `GET` to change state.
+- 202 is only for work that is accepted onto a queue and not finished in the request. The response then includes a link to the status resource. Do not use 202 as a vague success.
+
+`POST`, `PUT`, and `PATCH` require a body and `Content-Type`. `GET` and `DELETE` reject a JSON body with 400 if one is sent.
+
+### 11.4 Representations
+
+- Success bodies are JSON objects, `Content-Type: application/json`.
+- `POST`, `PUT` consume `application/json`. `PATCH` consumes `application/merge-patch+json`.
+- A client that only accepts XML or another type receives 406. A write with the wrong `Content-Type` receives 415.
+- Unknown JSON members are ignored so a client can send a newer field. Required members are Bean Validation constraints.
+- Dates and times are ISO-8601 strings. Instants are UTC. Epoch numbers are not used.
+- Enum values are stable uppercase names. Clients must tolerate an unknown enum value. Adding a value is compatible only because of that rule; document it on the enum in OpenAPI.
+- The body does not expose table names, foreign-key column names, JPA annotations, or SQL. Optimistic concurrency is the `ETag`, not a `version` field the client edits by hand.
+- Do not return `null` for an empty collection. Return `[]`.
+
+### 11.5 Hypermedia
+
+Every resource representation includes `links`. `self` is always present and is a `GET` of that resource. Other relations appear only when that action is valid for the current state. The domain method decides, for example `order.canCancel()`. The mapper does not reimplement the rule.
+
+```json
+{
+  "id": "6f1b0c3e-9a2d-4f4a-8e1a-0d0c2b6a1001",
+  "status": "PLACED",
+  "links": {
+    "self": { "href": "https://api.company.com/api/v1/orders/6f1b0c3e-9a2d-4f4a-8e1a-0d0c2b6a1001", "method": "GET" },
+    "cancel": { "href": "https://api.company.com/api/v1/orders/6f1b0c3e-9a2d-4f4a-8e1a-0d0c2b6a1001/cancellations", "method": "POST" }
+  }
 }
 ```
 
-- `POST` that creates returns `201` and a `Location` header.
-- `GET` returns `200`.
-- `PUT` replaces and returns `200`.
-- `PATCH` is for a true partial document update. Null means "leave unchanged", and the request record's Javadoc says so. Prefer an action resource over a generic patch.
-- `DELETE` on a business aggregate is a state transition when the business needs history, and it returns `204`. A physical delete is for data that is not historical.
-- A create that clients retry accepts an `Idempotency-Key` header. The same key and the same body return the original response. The same key and a different body return `409`. The key is stored in the same transaction as the aggregate. One shared implementation serves the service. Features do not each invent a store.
-- Controllers are documented with springdoc. `@Tag` on the controller, `@Operation(summary = "...")` on each method. The published description is generated. Do not maintain a hand-written `openapi.yaml`.
-- `springdoc-openapi-starter-webmvc-ui` is the dependency. Swagger UI is enabled only in the `local` profile. `/v3/api-docs/**` and `/swagger-ui/**` require authentication outside `local`.
+```java
+public record Link(String href, String method) {
+}
+```
+
+`ApiLinks` in `shared/web` builds absolute URIs from `app.api.public-base-url`. Relation names are the map keys (`self`, `cancel`, `next`). Do not add Spring HATEOAS.
+
+A collection page includes `self` and, when another page exists, `next`. Offset pages also include `prev` when `page > 0`.
+
+### 11.6 Pagination, filtering, and sorting
+
+A collection endpoint is paginated. Returning every row is a defect.
+
+Cursor pagination is the default. Use it for any collection that grows, is append-heavy, or whose total count is expensive.
+
+| | Cursor | Offset |
+| --- | --- | --- |
+| When | Default for new collections | Admin lists that need a page number and a total, and stay small |
+| Request | `?limit=20&cursor={opaque}` | `?page=0&size=20&sort=createdAt,desc` |
+| `limit` / `size` | Default 20, maximum 100 | Default 20, maximum 100 |
+| Response type inside the service | `CursorPage<T>` (`items`, `nextCursor`) | `OffsetPage<T>` (`items`, `page`, `size`, `totalElements`, `totalPages`) |
+| End of data | `nextCursor` is null and `next` is absent | `page` is the last page and `next` is absent |
+
+- `page` is zero-based. The first page is `0`, not `1`.
+- The cursor is opaque. Clients send it back unchanged. It is not an offset integer and not a raw timestamp the client may edit.
+- One endpoint uses one style. Do not accept both `page` and `cursor`.
+- Offset queries add a unique tie-break, the id, after the requested sort. `createdAt` alone is not a stable order.
+- Changing `sort` starts a new cursor or a new offset sequence. The client does not reuse the old cursor.
+- Filters are camelCase field names: `GET /api/v1/orders?status=PLACED&customerId={uuid}`. Repeating one parameter means OR for that field: `?status=PLACED&status=CANCELLED`.
+- An unknown filter or sort field returns 400, problem code `unknown-query-parameter`. Do not ignore it. A typo must not silently return an unfiltered collection.
+- There is no generic query language (`filter=status:PLACED`, RSQL, or a SQL fragment) unless this standard is changed.
+
+`spring.data.web.pageable.max-page-size` is 100 and `default-page-size` is 20. A cursor endpoint enforces the same maximum in the controller. A `limit` or `size` above the maximum is 400, not a silent clamp.
+
+### 11.7 Caching and conditional requests
+
+| Response | `Cache-Control` | Validators |
+| --- | --- | --- |
+| Authenticated `GET` | `private, no-cache` | Strong `ETag` |
+| `POST`, `PUT`, `PATCH`, `DELETE` | `no-store` | `ETag` of the new state on 200 and 201 |
+| Problem Details | `no-store` | None |
+| `304` | The same cache header as the GET, no body | The current `ETag` |
+
+- The `ETag` is the aggregate version in quotes, for example `"3"`. `ResponseEntity.eTag` supplies the quotes. Weak ETags are not used.
+- After `save`, the returned aggregate exposes `version()`. The JPA `@Version` column is the persistence of that number. The domain type does not import JPA.
+- `GET` calls `WebRequest.checkNotModified(etag)` before writing the body. A match returns 304.
+- `PUT` and `PATCH` require `If-Match`. A missing header is 428 (`PreconditionRequiredException`). A stale value is 412 (`PreconditionFailedException`). A lost race that still reaches the database maps `ObjectOptimisticLockingFailureException` to 412 as well.
+- Authenticated bodies are never `public`. Do not set a long `max-age` on private data.
+- `Vary: Authorization` is set on responses that depend on the caller.
+
+### 11.8 Status codes
+
+| Status | When |
+| --- | --- |
+| 200 | GET, PUT, PATCH, or an action POST that returns a representation |
+| 201 | POST created a resource. `Location` is the new `self` URI |
+| 202 | Work was queued. The body links to the status resource |
+| 204 | DELETE succeeded. No body |
+| 304 | GET and `If-None-Match` matches. No body |
+| 400 | Malformed JSON, Bean Validation, unknown query parameter, or a body on GET or DELETE |
+| 401 | Missing or invalid credentials. Include `WWW-Authenticate: Bearer` |
+| 403 | Authenticated, not allowed |
+| 404 | The resource is not in the API, including after DELETE |
+| 405 | Method not mapped. Include `Allow` |
+| 406 | `Accept` does not allow JSON or Problem Details |
+| 409 | Unique-key conflict, or the same `Idempotency-Key` reused with a different body |
+| 412 | `If-Match` does not match the current version |
+| 415 | `Content-Type` is not the type this method consumes |
+| 422 | The representation is understood and a business rule rejects it |
+| 428 | `PUT` or `PATCH` without `If-Match` |
+| 429 | Rate limited. Include `Retry-After` in seconds |
+| 500 | Unexpected failure. Generic detail |
+| 502 / 504 | A downstream call failed or timed out |
+| 503 | This service is unavailable. Include `Retry-After` when the pause is known |
+
+### 11.9 Idempotency-Key
+
+A `POST` that creates a resource and can be retried requires `Idempotency-Key`. The same key and the same body return the original status and body. The same key and a different body return 409. The key is stored in the same transaction as the aggregate. One implementation serves the whole service. Features do not each invent a store.
+
+### 11.10 Versioning
+
+- The version is a path prefix, `/api/v1`, from the first release. Do not version with a query parameter or a custom header.
+- A breaking change is a new prefix, `/api/v2`, in package `api/v2`, sharing the same application and domain. A breaking change removes or renames a field, changes a type or a status meaning, changes a URI, or makes an optional field required.
+- Adding an optional JSON member, adding an endpoint, and adding an enum value that clients already tolerate are compatible. They stay on v1.
+- Shipped v1 behavior is not "fixed" by changing it in place. A defect fix that changes a documented status or field is a new version.
+- While v1 is being retired, its responses include `Sunset` (RFC 8594) and `Link: <{successor}>; rel="successor-version"`.
+- Do not fork the domain per version.
+
+### 11.11 Documentation
+
+Controllers carry `@Tag`. Each method carries `@Operation(summary = "...")`. springdoc publishes the description. Do not hand-maintain `openapi.yaml`. The dependency is `springdoc-openapi-starter-webmvc-ui`. Swagger UI is enabled only in the `local` profile. Outside `local`, `/v3/api-docs/**` and `/swagger-ui/**` require authentication.
+
+Document the method, success status, problem statuses, required headers (`Authorization`, `Content-Type`, `Idempotency-Key`, `If-Match`), and whether the collection is cursor or offset.
 
 ## 12. Validation and errors
 
@@ -715,12 +883,18 @@ Every error body uses `ProblemDetail` (`application/problem+json`).
 
 | Situation | Status | Exception |
 | --- | --- | --- |
-| Malformed JSON or failed Bean Validation | 400 | framework types, mapped in the handler |
-| Missing route or missing aggregate | 404 | `NotFoundException` |
-| Unique-key clash, stale `@Version`, idempotency key reused with a different body | 409 | `ConflictException` |
-| Well-formed request rejected by a business rule | 422 | `BusinessRuleException` |
+| Malformed JSON, failed Bean Validation, unknown query parameter, body on GET or DELETE | 400 | framework types, or `BadRequestException` |
+| Missing or invalid credentials | 401 | Spring Security, with `WWW-Authenticate: Bearer` |
 | Authenticated but not allowed | 403 | Spring Security |
-| Missing or invalid credentials | 401 | Spring Security |
+| Missing route or missing aggregate | 404 | `NotFoundException` |
+| Method not mapped | 405 | framework type, with `Allow` |
+| `Accept` cannot be satisfied | 406 | `HttpMediaTypeNotAcceptableException` |
+| Unique-key clash, or idempotency key reused with a different body | 409 | `ConflictException` |
+| `If-Match` does not match, including a lost `@Version` update | 412 | `PreconditionFailedException` |
+| Wrong `Content-Type` | 415 | `HttpMediaTypeNotSupportedException` |
+| Well-formed request rejected by a business rule | 422 | `BusinessRuleException` |
+| `PUT` or `PATCH` without `If-Match` | 428 | `PreconditionRequiredException` |
+| Rate limited | 429 | handler, with `Retry-After` |
 | Remote system returned an error, or the call timed out | 502 or 504 | exception thrown by the client adapter |
 | Unexpected failure | 500 | handler, generic detail |
 
@@ -746,6 +920,8 @@ public abstract class DomainException extends RuntimeException {
 
 `NotFoundException`, `ConflictException`, and `BusinessRuleException` extend `DomainException` and fix nothing about HTTP. Each one exposes a constructor of `(String problemCode, String message)`. The handler chooses the status. A feature exception passes a stable kebab-case code.
 
+`BadRequestException`, `PreconditionRequiredException`, and `PreconditionFailedException` also extend `DomainException`, with default codes `bad-request`, `precondition-required`, and `precondition-failed`. The API layer raises them for protocol failures. Aggregates do not. Pass a more specific code when the failure has one, for example `unknown-query-parameter`. Do not add a subclass per query parameter.
+
 ```java
 public final class OrderNotFoundException extends NotFoundException {
 
@@ -765,6 +941,9 @@ The handler:
 - Adds `traceId` from MDC when present.
 - For validation, adds an `errors` array of `{field, message}`.
 - For a 500, sets `detail` to `Unexpected error` and logs the exception. The response does not contain the exception message, the SQL, or a class name.
+- Sets `Cache-Control: no-store` on every problem response.
+- Adds `WWW-Authenticate`, `Allow`, or `Retry-After` when section 11.8 requires that header.
+- Maps the framework exceptions in the table above so Spring's default error body is never returned.
 
 One `@RestControllerAdvice` exists: `ApiExceptionHandler`. A feature adds an exception type. It does not add another advice.
 
@@ -780,7 +959,7 @@ One `@RestControllerAdvice` exists: `ApiExceptionHandler`. A feature adds an exc
 - A merged migration is immutable. Repair a mistake with a new migration.
 - One migration, one concern.
 - A breaking column change follows expand then contract: add the new column, backfill, switch the code, drop the old column in a later release.
-- Optimistic locking is the default for updates. Map `ObjectOptimisticLockingFailureException` to `409`. Pessimistic locks require a comment in the adapter naming the contention they prevent.
+- Optimistic locking is the default for updates. The API expresses it as `ETag` and `If-Match` (section 11.7). A lost update maps `ObjectOptimisticLockingFailureException` to 412. Pessimistic locks require a comment in the adapter naming the contention they prevent.
 - The transaction boundary is the application-service method. Default propagation is `REQUIRED`.
 
 ## 14. Time, money, and identifiers
@@ -866,6 +1045,11 @@ spring:
 server:
   port: 8080
   shutdown: graceful
+  forward-headers-strategy: framework
+
+app:
+  api:
+    public-base-url: https://api.company.com
 
 management:
   server:
@@ -925,7 +1109,7 @@ Tests follow the production package. They use JUnit Jupiter, AssertJ, and Mockit
 | --- | --- |
 | Domain rule | `{Type}Test`, plain JUnit, no Spring. Cover the failure and the success. |
 | Application branching and port interaction | `{Type}Test` with Mockito. No Spring context. |
-| HTTP status, validation, and JSON shape | `{Controller}Test` with `@WebMvcTest` and `@MockitoBean` for the application services |
+| HTTP status, validation, JSON shape, `self` link, `ETag`, and `Cache-Control` | `{Controller}Test` with `@WebMvcTest` and `@MockitoBean` for the application services |
 | Repository adapter, queries, and migrations | `{Type}IT` with `@DataJpaTest`, Testcontainers PostgreSQL, `@AutoConfigureTestDatabase(replace = Replace.NONE)`, `@ServiceConnection` |
 | Security rule on a route | the `@WebMvcTest`, with security enabled for that assertion |
 | Layer dependency | `LayeringArchTest`, extended when a new top-level package appears |
@@ -1034,6 +1218,7 @@ class LayeringArchTest {
                         "..application..",
                         "..infrastructure..",
                         "..shared.web..",
+                        "..shared.paging..",
                         "jakarta.validation..",
                         "org.slf4j..")
                 .check(classes);
@@ -1043,7 +1228,11 @@ class LayeringArchTest {
     void applicationDoesNotDependOnApiOrInfrastructure() {
         noClasses()
                 .that().resideInAPackage("..application..")
-                .should().dependOnClassesThat().resideInAnyPackage("..api..", "..infrastructure..", "jakarta.persistence..")
+                .should().dependOnClassesThat().resideInAnyPackage(
+                        "..api..",
+                        "..infrastructure..",
+                        "..shared.web..",
+                        "jakarta.persistence..")
                 .check(classes);
     }
 
@@ -1126,6 +1315,7 @@ Not approved:
 - `RestTemplate` for new clients. An existing client may stay until a change touches it, and that change converts it to `RestClient`.
 - WebFlux in an MVC service.
 - A second JSON library.
+- Spring HATEOAS (`spring-boot-starter-hateoas`). Links are the `Link` record in section 11.5.
 - A CRUD generator, a generic repository framework, or a base-controller library.
 - `spring-boot-properties-migrator` in a service that was born on Boot 4. It is a migration aid, not a runtime dependency.
 
@@ -1135,9 +1325,9 @@ A library outside this list is a visible decision in the change description. The
 
 Before writing code:
 
-1. Read section 2 and section 5.
+1. Read section 2 and section 5. If the change adds or alters an endpoint, read section 11 before writing the controller.
 2. Find the feature package. Name it with the grouping algorithm. Do not create a parallel tree.
-3. List the files you will add, each with its layer, and check them against the table in section 5.
+3. List the files you will add, each with its layer, and check them against the table in section 5. Choose the path, method, status, cache header, and link relations from section 11. Do not invent a second URL or error style.
 4. Reuse the starter types in `shared.error` and `shared.web`. Do not create a second exception hierarchy or a second page wrapper.
 5. Use the Boot 4 column of the trap table for every import and dependency.
 
@@ -1170,7 +1360,9 @@ If a rule cannot be followed, say which rule and why. Do not quietly start a sec
 - [ ] Spring Data extends `Repository` and declares the methods it uses.
 - [ ] `@Transactional` is on the application service. Queries are read-only.
 - [ ] No HTTP call inside an open database transaction without an outbox.
-- [ ] Errors go through `ApiExceptionHandler` and Problem Details.
+- [ ] Errors go through `ApiExceptionHandler` and Problem Details. No failure is returned as HTTP 200.
+- [ ] Paths, methods, statuses, pagination, `ETag`, `Cache-Control`, and `links` match section 11. `PUT` and `PATCH` require `If-Match`.
+- [ ] Resource URIs come from `ApiLinks` and the public base URL. The body has no view-model labels and no executable content.
 - [ ] A schema change is a new immutable Flyway migration, and `ddl-auto` remains `validate`.
 - [ ] Names match section 7. Source types have no `Impl`, no `I` prefix, no `DTO`, and no `Utils`. MapStruct's generated `{Mapper}Impl` is the only exception.
 - [ ] Constructor injection. No `@Value`, no field injection, no Lombok.
@@ -1186,7 +1378,7 @@ Task: add "cancel an order". The `order` feature already exists and already has 
 
 | File | Layer | What changes |
 | --- | --- | --- |
-| `order/api/OrderController.java` | api | `POST /api/v1/orders/{orderId}/cancellations` |
+| `order/api/OrderController.java` | api | `POST /api/v1/orders/{orderId}/cancellations`. Success is 200 with `Cache-Control: no-store` and no `cancel` link. Rejection is 422 |
 | `order/api/CancelOrderRequest.java` | api | record with `@NotBlank String reason` |
 | `order/application/CancelOrderService.java` | application | load, `order.cancel(reason)`, save |
 | `order/domain/Order.java` | domain | `cancel` enforces the state rule |
