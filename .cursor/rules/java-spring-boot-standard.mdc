@@ -17,6 +17,7 @@ Until the file is open, follow these constraints:
 - Constructor injection. No Lombok, no field injection, no `@Value`, no `@MockBean`, no `I` prefix, no `Impl` suffix.
 - `@Transactional` on the application service. Flyway for schema. `ddl-auto: validate`. Problem Details for errors.
 - Persistence tests use Testcontainers PostgreSQL. H2 is forbidden.
+- Application services are concrete, public, not final, and stateless. Constructor injection is written out. `@Transactional` sits on the public service method. Configuration is a validated `@ConfigurationProperties` record, not `@Value` and not Lombok.
 - Design principles are section 8. Copy an accepted snippet. Do not add a service interface, a `*Utils` class, a setter-only aggregate, or a base class to satisfy SOLID or DRY.
 - REST endpoints follow section 11: plural noun paths, HTTP method semantics, JSON only, Problem Details (never HTTP 200 for a failure), `ETag` and `Cache-Control`, and a `self` link on every resource. No verb in a path, no `HttpSession`, no unbounded list, no Spring HATEOAS.
 - Every behavior change ships with the test type required in section 19 of the standard.

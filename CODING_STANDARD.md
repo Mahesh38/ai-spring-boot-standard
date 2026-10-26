@@ -583,7 +583,7 @@ A collaborator is a field. Inheritance is for a true is-a that stays substitutab
 Accepted.
 
 ```java
-public final class CancelOrderService {
+public class CancelOrderService {
     private final OrderRepository orders;
 
     public CancelOrderService(OrderRepository orders) {
@@ -847,7 +847,61 @@ public class OrderQueryService {
 
 A query that would hydrate an aggregate only to flatten it for a screen uses a query port in `application` (`OrderViewQuery`) implemented in infrastructure. The port returns `OrderView`, `OffsetPage<OrderView>`, or `CursorPage<OrderView>`. It does not return a JPA entity, and it does not build hyperlinks. The API mapper adds links.
 
-`@Transactional` is on the application service, on the public method or on the class for a query service. It is not on the controller, not on the domain, and not on the Spring Data interface. Self-invocation does not start a transaction; do not call a `@Transactional` method of `this` and expect a new boundary.
+`@Transactional` is on the application service, on a public method or on the class for a query service. It is not on the controller, not on the domain, and not on the Spring Data interface. The service class is public and not `final`: Boot applies the transaction with a class proxy, and a `final` class or a non-public method silently runs with no transaction.
+
+Self-invocation does not start a new transaction. `this.place(...)` from another method of the same class skips the proxy. If the second method needs its own transaction, move it to another bean and inject that bean. `Propagation.REQUIRES_NEW` is that case, and only that case. Two writes that must commit or roll back together stay in one public method with the default `REQUIRED`.
+
+Do not catch a domain exception and return null. The rollback happens only when the exception leaves the service. Unchecked exceptions roll back. Business failures are unchecked. Do not declare checked exceptions on a service method.
+
+A query service is `@Transactional(readOnly = true)` on the class. It has no method that calls `save`. A command service does not use `readOnly`.
+
+Accepted. One public method, one transaction, absence handled before the next step.
+
+```java
+@Transactional
+public Order cancel(CancelOrderCommand command) {
+    Order order = orders.findById(command.orderId())
+            .orElseThrow(() -> new OrderNotFoundException(command.orderId()));
+    order.cancel(command.reason());
+    return orders.save(order);
+}
+```
+
+Rejected. Field injection, a Lombok constructor, a JPA type in the signature, and a transaction annotation the proxy will ignore.
+
+```java
+@Service
+@RequiredArgsConstructor
+public final class OrderProcessingService {
+    @Autowired
+    private OrderJpaRepository orderRepository;
+
+    public OrderResponseDTO processOrder(Long orderId) {
+        OrderJpaEntity entity = orderRepository.findById(orderId).orElse(null);
+        this.audit(entity);
+        return new OrderResponseDTO(entity.getId());
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    void audit(OrderJpaEntity entity) {
+    }
+}
+```
+
+What that snippet gets wrong, and the replacement:
+
+| Blog habit | What we generate |
+| --- | --- |
+| `@RequiredArgsConstructor` | The constructor written in the class. Lombok stays banned. |
+| A service interface plus `OrderServiceImpl` for one implementation | The concrete `CancelOrderService`. An interface appears only for a port, or for a strategy that already has a second implementation. |
+| The service accepts `CreateOrderRequest` or returns `OrderResponse` | It accepts a command and returns the aggregate or a view. The controller maps HTTP. |
+| The service returns `OrderJpaEntity` | The entity never leaves `infrastructure`. `open-in-view` is false, so a lazy load in the controller would throw, not hide. |
+| One fat `OrderService` for every operation | One use case class. The invariant stays on the aggregate. "Logic in the service" means orchestration, not a second copy of the rule. |
+| `@Transactional` on a private, package-private, or `final` method, or on `this.audit()` | A public method on a non-final bean. A different boundary is a different bean. |
+| `orElse(null)` and a later null check | `orElseThrow` with the domain exception before any further work. |
+| `SQLException` or `DataAccessException` thrown to the controller | The adapter translates a constraint failure to `ConflictException`. The service throws domain exceptions. `ApiExceptionHandler` maps them. |
+
+The service is stateless. No field is assigned after the constructor. A request-scoped value is a parameter or a local variable, never a field on the `@Service`.
 
 Do not call another service over HTTP while holding a database transaction. Persist the local state, commit, then call. If the remote side must be consistent with the local commit, write an outbox row in the same transaction and let the relay call.
 
@@ -1285,22 +1339,73 @@ In-process reactions use a domain event record. The aggregate collects events. T
 
 ## 16. Configuration
 
-- `application.yml` is production-safe and committed.
-- `application-local.yml.example` is committed, with obvious local placeholders.
-- `application-local.yml` is gitignored.
-- Profiles are `local`, `test`, and `prod`. The platform sets `prod`. The jar does not default itself to `local`.
-- Secrets are environment variables with no default: `${DB_PASSWORD}`. A missing secret fails startup.
-- Grouped settings are `@ConfigurationProperties` records scanned from the application class. `@Value` is not used. `@ConstructorBinding` is not added; a record already has one constructor.
+Configuration is typed, validated, and free of secrets in source. Business code reads a properties record. It does not call `System.getenv`, and it does not use `@Value`.
+
+- `application.yml` is the only committed format. Do not also add `application.properties`.
+- The file is production-safe. Profiles are `local`, `test`, and `prod`. The platform sets `prod`. The jar does not set `spring.profiles.active` and does not default itself to `local`.
+- `application-local.yml.example` is committed. `application-local.yml` is gitignored. A profile file overrides the keys that differ. It does not copy the whole base file.
+- A secret is an environment variable with no default: `${DB_PASSWORD}`. A missing secret fails startup. Do not put a secret in a properties record. A record's `toString` would print it. Boot's datasource password stays on `spring.datasource.password`.
+- Non-secret settings for one concern are one `@ConfigurationProperties` record. The prefix is `app.{feature}.{concern}`. `@ConstructorBinding` is not added. A record already has one constructor.
+- `@Validated` and `ignoreUnknownFields = false` are set. A typo in a key fails startup. A missing required value fails startup. Durations and URIs use `Duration` and `URI`, not strings that the service parses.
+- `@ConfigurationPropertiesScan` is on the application class. Do not register every properties type with `@EnableConfigurationProperties`.
+- Feature properties and the `@Bean` methods that use them live in `{feature}/config`. Application-wide beans stay in the root `config`.
+- `@Configuration(proxyBeanMethods = false)` is the default. `@Bean` methods take their dependencies as parameters. They do not call each other, and they do not use `@Autowired` or `@Value`.
+- Do not log a properties object.
 
 ```java
-@ConfigurationProperties(prefix = "app.payment")
-public record PaymentClientProperties(
-        URI baseUrl,
-        Duration connectTimeout,
-        Duration readTimeout
-) {
+@SpringBootApplication
+@ConfigurationPropertiesScan
+public class OrderServiceApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(OrderServiceApplication.class, args);
+    }
 }
 ```
+
+```java
+@Validated
+@ConfigurationProperties(prefix = "app.payment", ignoreUnknownFields = false)
+public record PaymentClientProperties(
+        @NotNull URI baseUrl,
+        @NotNull Duration connectTimeout,
+        @NotNull Duration readTimeout
+) {
+    public PaymentClientProperties {
+        if (connectTimeout != null && (connectTimeout.isZero() || connectTimeout.isNegative())) {
+            throw new IllegalArgumentException("connectTimeout must be positive");
+        }
+        if (readTimeout != null && (readTimeout.isZero() || readTimeout.isNegative())) {
+            throw new IllegalArgumentException("readTimeout must be positive");
+        }
+    }
+}
+```
+
+```java
+@Configuration(proxyBeanMethods = false)
+class PaymentClientConfig {
+
+    @Bean
+    RestClient paymentRestClient(RestClient.Builder builder, PaymentClientProperties properties) {
+        JdkClientHttpRequestFactory requestFactory = new JdkClientHttpRequestFactory(
+                HttpClient.newBuilder().connectTimeout(properties.connectTimeout()).build());
+        requestFactory.setReadTimeout(properties.readTimeout());
+        return builder.baseUrl(properties.baseUrl().toString()).requestFactory(requestFactory).build();
+    }
+}
+```
+
+Rejected. A scattered `@Value`, a stringly-typed URL, and a default password.
+
+```java
+@Bean
+RestClient paymentRestClient(@Value("${app.payment.base-url:http://localhost}") String baseUrl,
+                             @Value("${PAYMENT_PASSWORD:secret}") String password) {
+    return RestClient.builder().baseUrl(baseUrl).build();
+}
+```
+
+A value rule on the record is tested by constructing it. A binding rule is tested with `ApplicationContextRunner`. Neither test is a `@SpringBootTest`.
 
 ```yaml
 spring:
@@ -1343,6 +1448,10 @@ server:
 app:
   api:
     public-base-url: https://api.company.com
+  payment:
+    base-url: https://payments.internal
+    connect-timeout: 2s
+    read-timeout: 5s
 
 management:
   server:
@@ -1419,6 +1528,30 @@ Rules for the tests themselves:
 - Tests do not depend on each other or on execution order.
 - Time-sensitive tests inject `Clock.fixed`.
 - Persistence tests do not use H2.
+- A service test constructs the service with `new`. It does not boot Spring and it does not use `@InjectMocks`. A new constructor parameter then fails compilation instead of remaining null.
+
+Service test shape:
+
+```java
+class CancelOrderServiceTest {
+
+    private final OrderRepository orders = mock(OrderRepository.class);
+    private final CancelOrderService service = new CancelOrderService(orders);
+
+    @Test
+    void shouldRejectWhenTheOrderIsMissing() {
+        OrderId id = new OrderId(UUID.randomUUID());
+        when(orders.findById(id)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> service.cancel(new CancelOrderCommand(id, "customer changed their mind")))
+                .isInstanceOf(OrderNotFoundException.class);
+
+        verify(orders, never()).save(any());
+    }
+}
+```
+
+Static-import `org.mockito.Mockito.mock`, `when`, `verify`, and `never`, and AssertJ `assertThatThrownBy`. `@Mock` and `@InjectMocks` are not used.
 
 Controller test shape:
 
@@ -1627,6 +1760,8 @@ Before writing code:
 While writing code:
 
 - Match the canonical shapes in section 10 and the accepted snippets in section 8. Same annotations, same constructor injection, same mapping split.
+- A service stays concrete, public, not final, and stateless. Copy the accepted transaction method, not the Lombok and `@Autowired` example.
+- Configuration is a validated `@ConfigurationProperties` record from section 16. Do not add `@Value`.
 - Do not add an interface to an application service. Do not add a `Utils`, `Helper`, or base class to satisfy a principle.
 - Do not put `@Entity` on a domain type.
 - Do not "improve" unrelated code, reformat the repository, or upgrade the framework inside a feature change.
@@ -1651,7 +1786,8 @@ If a rule cannot be followed, say which rule and why. Do not quietly start a sec
 - [ ] New types match an accepted snippet in section 8. No one-implementation service interface, no `Utils` or `Helper`, no base class, no setter that skips an invariant.
 - [ ] JPA entities and Spring Data interfaces are package-private and stay in `infrastructure/persistence`.
 - [ ] Spring Data extends `Repository` and declares the methods it uses.
-- [ ] `@Transactional` is on the application service. Queries are read-only.
+- [ ] `@Transactional` is on a public method of a non-final application service. Queries are read-only. A second transaction boundary is a second bean.
+- [ ] Settings are a validated `@ConfigurationProperties` record. No `@Value`. No secret inside a record. No default password.
 - [ ] No HTTP call inside an open database transaction without an outbox.
 - [ ] Errors go through `ApiExceptionHandler` and Problem Details. No failure is returned as HTTP 200.
 - [ ] Paths, methods, statuses, pagination, `ETag`, `Cache-Control`, and `links` match section 11. `PUT` and `PATCH` require `If-Match`.
